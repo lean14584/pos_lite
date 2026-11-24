@@ -8,9 +8,8 @@ use Illuminate\Support\Facades\Schema;
  * SQLite (el driver de esta app) no indexa automáticamente las columnas de
  * foreignId()->constrained() como sí hace MySQL con InnoDB — verificado con
  * PRAGMA index_list() contra la base real: ni invoice_items, ni
- * purchase_items, ni quote_items, ni messages, ni tasks tenían un solo
- * índice antes de esta migración. Cada join o filtro por esas columnas
- * hacía table scan completo.
+ * purchase_items, ni quote_items tenían un solo índice antes de esta
+ * migración. Cada join o filtro por esas columnas hacía table scan completo.
  */
 return new class extends Migration
 {
@@ -62,18 +61,6 @@ return new class extends Migration
 
         Schema::table('provider_payments', function (Blueprint $table) {
             $table->index('provider_id');
-        });
-
-        Schema::table('messages', function (Blueprint $table) {
-            $table->index('sender_id');
-            // Consultado en cada request por Message::unreadFor() (badge del sidebar).
-            $table->index(['recipient_id', 'read_at']);
-        });
-
-        Schema::table('tasks', function (Blueprint $table) {
-            $table->index('assigned_by');
-            // Consultado en cada request por el badge de tareas abiertas del sidebar.
-            $table->index(['status', 'assigned_to']);
         });
 
         Schema::table('audit_logs', function (Blueprint $table) {
@@ -133,16 +120,6 @@ return new class extends Migration
 
         Schema::table('provider_payments', function (Blueprint $table) {
             $table->dropIndex(['provider_id']);
-        });
-
-        Schema::table('messages', function (Blueprint $table) {
-            $table->dropIndex(['sender_id']);
-            $table->dropIndex(['recipient_id', 'read_at']);
-        });
-
-        Schema::table('tasks', function (Blueprint $table) {
-            $table->dropIndex(['assigned_by']);
-            $table->dropIndex(['status', 'assigned_to']);
         });
 
         Schema::table('audit_logs', function (Blueprint $table) {

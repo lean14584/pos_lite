@@ -8,7 +8,6 @@ use App\Http\Controllers\InvoicePdfController;
 use App\Http\Controllers\LibroIvaExportController;
 use App\Http\Controllers\MercadoPagoWebhookController;
 use App\Http\Controllers\ProductExportController;
-use App\Http\Controllers\PromotionPosterController;
 use App\Http\Controllers\ProviderAccountStatementController;
 use App\Http\Controllers\ReciboPdfController;
 use App\Http\Controllers\RemitoPdfController;
@@ -43,7 +42,6 @@ use App\Livewire\Invoices\FacturarRemito;
 use App\Livewire\Invoices\Index as InvoiceIndex;
 use App\Livewire\Invoices\Show as InvoiceShow;
 use App\Livewire\LibroIva\Index as LibroIvaIndex;
-use App\Livewire\Messages\Index as MessagesIndex;
 use App\Livewire\NotasCredito\Create as NotaCreditoCreate;
 use App\Livewire\PedidosOnline\Index as PedidosOnlineIndex;
 use App\Livewire\Pos\Index;
@@ -65,17 +63,11 @@ use App\Livewire\Purchases\Edit as PurchaseEdit;
 use App\Livewire\Purchases\Index as PurchaseIndex;
 use App\Livewire\Purchases\Show as PurchaseShow;
 use App\Livewire\Purchases\Suggestions as PurchaseSuggestions;
-use App\Livewire\Quotes\Create as QuoteCreate;
-use App\Livewire\Quotes\Edit as QuoteEdit;
-use App\Livewire\Quotes\Index as QuoteIndex;
-use App\Livewire\Quotes\Show as QuoteShow;
 use App\Livewire\Reports\Index as ReportsIndex;
 use App\Livewire\StockTransfers\Show;
 use App\Livewire\Sucursales\Create as SucursalCreate;
 use App\Livewire\Sucursales\Edit as SucursalEdit;
 use App\Livewire\Sucursales\Index as SucursalIndex;
-use App\Livewire\Tasks\Create as TaskCreate;
-use App\Livewire\Tasks\Index as TaskIndex;
 use App\Livewire\Tienda\Account\ForgotPassword as TiendaAccountForgotPassword;
 use App\Livewire\Tienda\Account\Login as TiendaAccountLogin;
 use App\Livewire\Tienda\Account\Orders as TiendaAccountOrders;
@@ -155,13 +147,6 @@ Route::middleware('auth')->group(function () {
 
     Route::middleware('module:pos')->get('pos', Index::class)->name('pos.index');
 
-    Route::middleware('module:quotes')->prefix('quotes')->name('quotes.')->group(function () {
-        Route::get('/', QuoteIndex::class)->name('index');
-        Route::get('/new', QuoteCreate::class)->name('create');
-        Route::get('/{quote}', QuoteShow::class)->name('show');
-        Route::get('/{quote}/edit', QuoteEdit::class)->name('edit');
-    });
-
     Route::middleware('module:invoices')->prefix('invoices')->name('invoices.')->group(function () {
         Route::get('/', InvoiceIndex::class)->name('index');
         if (config('features.invoices_manual_create')) {
@@ -199,8 +184,6 @@ Route::middleware('auth')->group(function () {
             Route::get('/importar', HistoricalSaleImport::class)->name('import');
         });
     }
-
-    Route::middleware('module:cobranzas')->get('cobranzas', App\Livewire\Cobranzas\Index::class)->name('cobranzas.index');
 
     Route::middleware('module:products')->prefix('products')->name('products.')->group(function () {
         Route::get('/', ProductIndex::class)->name('index');
@@ -242,16 +225,6 @@ Route::middleware('auth')->group(function () {
         });
     }
 
-    Route::middleware('module:promotions')->prefix('promociones')->name('promotions.')->group(function () {
-        Route::get('/', App\Livewire\Promotions\Index::class)->name('index');
-        Route::get('/familias', App\Livewire\PromotionGroups\Index::class)->name('groups.index');
-        Route::get('/cartel', PromotionPosterController::class)->name('poster');
-    });
-
-    Route::middleware('module:discounts')->prefix('mis-descuentos')->name('discounts.')->group(function () {
-        Route::get('/', App\Livewire\Discounts\Index::class)->name('index');
-    });
-
     Route::middleware('module:providers')->prefix('providers')->name('providers.')->group(function () {
         Route::get('/', ProviderIndex::class)->name('index');
         Route::get('/new', ProviderCreate::class)->name('create');
@@ -291,15 +264,6 @@ Route::middleware('auth')->group(function () {
         Route::get('/', UserIndex::class)->name('index');
         Route::get('/new', UserCreate::class)->name('create');
         Route::get('/{user}/edit', UserEdit::class)->name('edit');
-    });
-
-    Route::middleware('module:messages')->prefix('messages')->name('messages.')->group(function () {
-        Route::get('/{with?}', MessagesIndex::class)->name('index');
-    });
-
-    Route::middleware('module:tasks')->prefix('tasks')->name('tasks.')->group(function () {
-        Route::get('/', TaskIndex::class)->name('index');
-        Route::get('/new', TaskCreate::class)->name('create');
     });
 
     Route::middleware('module:company-settings')->prefix('company-settings')->name('company-settings.')->group(function () {

@@ -7,11 +7,8 @@ use App\Models\Category;
 use App\Models\Client;
 use App\Models\PriceList;
 use App\Models\Product;
-use App\Models\Promotion;
-use App\Models\PromotionGroup;
 use App\Models\Provider;
 use App\Models\Purchase;
-use App\Models\Quote;
 use App\Models\Sucursal;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -20,8 +17,8 @@ use Tests\TestCase;
 
 /**
  * Antes de este fix, cualquier rol con acceso al módulo (Vendedor en
- * products-manage/categories/price-lists/clients/quotes/promotions, Cajero
- * en clients) podía borrar sin ningún chequeo más fino que ese — igual que
+ * products-manage/categories/price-lists/clients, Cajero en clients) podía
+ * borrar sin ningún chequeo más fino que ese — igual que
  * pasaba con Invoices\Show::delete() antes de restringirlo a Admin/Encargado
  * (ver test_cajero_no_puede_eliminar_un_comprobante en
  * InvoiceStockAndCashTest). Acá se extiende el mismo criterio al resto de
@@ -106,37 +103,6 @@ class DeleteRestrictedToAdminEncargadoTest extends TestCase
         $this->assertDatabaseHas('clients', ['id' => $client->id]);
     }
 
-    public function test_vendedor_no_puede_eliminar_un_presupuesto(): void
-    {
-        $vendedor = User::factory()->create(['role' => Role::Vendedor, 'active' => true]);
-        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
-        $quote = Quote::create([
-            'number' => 'PRE-0001', 'client_id' => $client->id,
-            'issue_date' => now(), 'valid_until' => now()->addDays(15), 'status' => 'draft',
-        ]);
-
-        Livewire::actingAs($vendedor)
-            ->test('quotes.show', ['quote' => $quote])
-            ->call('delete')
-            ->assertStatus(403);
-
-        $this->assertDatabaseHas('quotes', ['id' => $quote->id]);
-    }
-
-    public function test_vendedor_no_puede_eliminar_una_promocion(): void
-    {
-        $vendedor = User::factory()->create(['role' => Role::Vendedor, 'active' => true]);
-        $product = Product::create(['name' => 'Notebook', 'price' => 1000, 'stock' => 5]);
-        $promotion = Promotion::create(['product_id' => $product->id, 'type' => 'nxm', 'buy_qty' => 2, 'pay_qty' => 1, 'active' => true]);
-
-        Livewire::actingAs($vendedor)
-            ->test('promotions.index')
-            ->call('delete', $promotion->id)
-            ->assertStatus(403);
-
-        $this->assertDatabaseHas('promotions', ['id' => $promotion->id]);
-    }
-
     public function test_cajero_no_puede_eliminar_una_compra(): void
     {
         $cajero = User::factory()->create(['role' => Role::Cajero, 'active' => true, 'sucursal_id' => Sucursal::sole()->id]);
@@ -152,18 +118,5 @@ class DeleteRestrictedToAdminEncargadoTest extends TestCase
             ->assertStatus(403);
 
         $this->assertDatabaseHas('purchases', ['id' => $purchase->id]);
-    }
-
-    public function test_vendedor_no_puede_eliminar_una_familia_de_promocion(): void
-    {
-        $vendedor = User::factory()->create(['role' => Role::Vendedor, 'active' => true]);
-        $group = PromotionGroup::create(['name' => 'Gaseosas', 'buy_qty' => 3, 'pay_qty' => 2, 'active' => true]);
-
-        Livewire::actingAs($vendedor)
-            ->test('promotion-groups.index')
-            ->call('delete', $group->id)
-            ->assertStatus(403);
-
-        $this->assertDatabaseHas('promotion_groups', ['id' => $group->id]);
     }
 }

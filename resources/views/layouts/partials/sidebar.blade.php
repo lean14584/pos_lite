@@ -1,18 +1,14 @@
 @php
     use App\Models\CompanySettings;
     use App\Models\Invoice;
-    use App\Models\Message;
     use App\Models\Product;
     use App\Models\ProductBatch;
-    use App\Models\Task;
     use App\Models\TiendaPedido;
     use App\Support\Permissions;
 
     $lowStockCount = Product::lowStockCountCached();
     $expiringBatchesCount = ProductBatch::alertCountCached();
     $pendientesEmision = Invoice::pendientesDeEmisionCountCached();
-    $unreadMessagesCount = auth()->check() ? Message::unreadCountCached(auth()->id()) : 0;
-    $openTasksCount = auth()->check() ? Task::openCountCached(auth()->user()) : 0;
     $tiendaOnlineHabilitada = CompanySettings::current()->tienda_online_habilitada;
     $pedidosOnlineEnCurso = $tiendaOnlineHabilitada ? TiendaPedido::enCursoCountCached() : 0;
 
@@ -27,17 +23,13 @@
         ['module' => 'dashboard', 'group' => null, 'pattern' => 'dashboard', 'href' => route('dashboard'), 'label' => 'Dashboard', 'icon' => 'home'],
 
         ['module' => 'pos', 'group' => 'Ventas', 'pattern' => 'pos.*', 'href' => route('pos.index'), 'label' => 'Venta rápida', 'icon' => 'bolt'],
-        ['module' => 'quotes', 'group' => 'Ventas', 'pattern' => 'quotes.*', 'href' => route('quotes.index'), 'label' => 'Presupuestos', 'icon' => 'clipboard-document-list'],
         ['module' => 'invoices', 'group' => 'Ventas', 'pattern' => 'invoices.*', 'href' => route('invoices.index'), 'label' => 'Facturas', 'icon' => 'document-text', 'badge' => $pendientesEmision],
         ['module' => 'invoices', 'group' => 'Ventas', 'pattern' => 'pedidos-online.*', 'href' => route('pedidos-online.index'), 'label' => 'Pedidos online', 'icon' => 'shopping-bag', 'badge' => $pedidosOnlineEnCurso],
-        ['module' => 'cobranzas', 'group' => 'Ventas', 'pattern' => 'cobranzas.*', 'href' => route('cobranzas.index'), 'label' => 'Cobranzas', 'icon' => 'banknotes'],
         ['module' => 'clients', 'group' => 'Ventas', 'pattern' => 'clients.*', 'href' => route('clients.index'), 'label' => 'Clientes', 'icon' => 'users'],
 
         ['module' => 'products', 'group' => 'Productos', 'pattern' => 'products.*', 'href' => route('products.index'), 'label' => 'Productos', 'icon' => 'cube', 'badge' => $lowStockCount],
         ['module' => 'categories', 'group' => 'Productos', 'pattern' => 'categories.*', 'href' => route('categories.index'), 'label' => 'Categorías', 'icon' => 'tag'],
         ['module' => 'price-lists', 'group' => 'Productos', 'pattern' => 'price-lists.*', 'href' => $safeRoute('price-lists.index'), 'label' => 'Listas de precios', 'icon' => 'currency-dollar'],
-        ['module' => 'promotions', 'group' => 'Productos', 'pattern' => 'promotions.*', 'href' => route('promotions.index'), 'label' => 'Promociones', 'icon' => 'gift'],
-        ['module' => 'discounts', 'group' => 'Productos', 'pattern' => 'discounts.*', 'href' => route('discounts.index'), 'label' => 'Mis Descuentos', 'icon' => 'receipt-percent'],
         ['module' => 'stock-adjustments', 'group' => 'Productos', 'pattern' => 'stock-adjustments.*', 'href' => route('stock-adjustments.index'), 'label' => 'Ajustes de Stock', 'icon' => 'wrench'],
         ['module' => 'stock-transfers', 'group' => 'Productos', 'pattern' => 'stock-transfers.*', 'href' => $safeRoute('stock-transfers.index'), 'label' => 'Envío de Mercadería', 'icon' => 'arrows-right-left'],
         ['module' => 'product-batches', 'group' => 'Productos', 'pattern' => 'product-batches.*', 'href' => $safeRoute('product-batches.index'), 'label' => 'Lotes y Vencimientos', 'icon' => 'calendar-days', 'badge' => $expiringBatchesCount],
@@ -51,8 +43,6 @@
         ['module' => 'reports', 'group' => 'Finanzas', 'pattern' => 'reports.*', 'href' => route('reports.index'), 'label' => 'Informes', 'icon' => 'chart-bar'],
         ['module' => 'libro-iva', 'group' => 'Finanzas', 'pattern' => 'libro-iva.*', 'href' => route('libro-iva.index'), 'label' => 'Libro IVA', 'icon' => 'receipt-percent'],
 
-        ['module' => 'messages', 'group' => 'Equipo', 'pattern' => 'messages.*', 'href' => route('messages.index'), 'label' => 'Mensajes', 'icon' => 'chat-bubble-left-right', 'badge' => $unreadMessagesCount],
-        ['module' => 'tasks', 'group' => 'Equipo', 'pattern' => 'tasks.*', 'href' => route('tasks.index'), 'label' => 'Tareas', 'icon' => 'check-circle', 'badge' => $openTasksCount],
         ['module' => 'users', 'group' => 'Equipo', 'pattern' => 'users.*', 'href' => route('users.index'), 'label' => 'Usuarios', 'icon' => 'shield-check'],
 
         ['module' => 'company-settings', 'group' => 'Configuración', 'pattern' => 'company-settings.*', 'href' => route('company-settings.edit'), 'label' => 'Datos de la empresa', 'icon' => 'building-office'],

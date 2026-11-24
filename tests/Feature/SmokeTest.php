@@ -9,7 +9,6 @@ use App\Models\Invoice;
 use App\Models\Product;
 use App\Models\Provider;
 use App\Models\Purchase;
-use App\Models\Quote;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Livewire\Livewire;
@@ -35,12 +34,6 @@ class SmokeTest extends TestCase
         ]);
         $invoice->items()->create(['product_id' => $product->id, 'description' => $product->name, 'quantity' => 1, 'unit_price' => 100]);
 
-        $quote = Quote::create([
-            'number' => 'PRE-0001', 'client_id' => $client->id, 'tax_rate' => 21,
-            'issue_date' => now(), 'valid_until' => now()->addDays(15), 'status' => 'draft',
-        ]);
-        $quote->items()->create(['product_id' => $product->id, 'description' => $product->name, 'quantity' => 1, 'unit_price' => 100]);
-
         $purchase = Purchase::create([
             'number' => 'COM-0001', 'provider_id' => $provider->id, 'tax_rate' => 21,
             'issue_date' => now(), 'due_date' => now()->addDays(15), 'status' => 'pending',
@@ -49,7 +42,6 @@ class SmokeTest extends TestCase
 
         $routes = [
             'dashboard',
-            'quotes.index', 'quotes.create', ['quotes.show', $quote], ['quotes.edit', $quote],
             'invoices.index', 'invoices.create', ['invoices.show', $invoice], ['invoices.edit', $invoice],
             'pedidos-online.index',
             'clients.index', 'clients.create', ['clients.edit', $client], ['clients.account', $client],

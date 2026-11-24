@@ -25,17 +25,26 @@ class DatabaseSeeder extends Seeder
      */
     public function run(): void
     {
+        // La migración de product_stocks ya se asegura de que exista al
+        // menos una sucursal ("Principal") — ver CurrentSucursal. Con
+        // multisucursal apagado (perfil de esta instalación), Users\Create
+        // auto-asigna esta misma sucursal a Vendedor/Cajero en vez de
+        // pedirla (ver su rules()) — acá se hace explícito para que los
+        // usuarios de muestra queden igual que los que carga un admin real,
+        // no con sucursal_id null.
+        $sucursalId = Sucursal::first()->id;
+
         User::query()->firstOrCreate(
             ['username' => 'admin'],
             ['name' => 'Administrador', 'password' => 'admin', 'role' => Role::Admin, 'active' => true]
         );
         User::query()->firstOrCreate(
             ['username' => 'vendedor'],
-            ['name' => 'Vendedor Demo', 'password' => 'vendedor', 'role' => Role::Vendedor, 'active' => true]
+            ['name' => 'Vendedor Demo', 'password' => 'vendedor', 'role' => Role::Vendedor, 'active' => true, 'sucursal_id' => $sucursalId]
         );
         User::query()->firstOrCreate(
             ['username' => 'cajero'],
-            ['name' => 'Cajero Demo', 'password' => 'cajero', 'role' => Role::Cajero, 'active' => true]
+            ['name' => 'Cajero Demo', 'password' => 'cajero', 'role' => Role::Cajero, 'active' => true, 'sucursal_id' => $sucursalId]
         );
 
         if (Category::count() > 0) {
@@ -60,7 +69,6 @@ class DatabaseSeeder extends Seeder
         // (product_stocks) — igual que hace Products\Create::save(). Sin
         // esto, los 5 productos de muestra arrancaban en 0 en cualquier
         // pantalla real, aunque products.stock mostrara la cantidad cargada.
-        $sucursalId = Sucursal::first()->id;
         foreach ($products as $product) {
             if (! $product->sold_by_weight && $product->stock > 0) {
                 ProductStock::create(['product_id' => $product->id, 'sucursal_id' => $sucursalId, 'stock' => $product->stock]);

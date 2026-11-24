@@ -538,7 +538,10 @@ class Edit extends Component
             $tabs['balanza'] = ['label' => 'Balanza', 'icon' => 'scale', 'fields' => ['barcode_scale_enabled', 'barcode_scale_prefix', 'barcode_scale_code_digits', 'barcode_scale_weight_digits']];
         }
 
-        $tabs['tienda_online'] = ['label' => 'Tienda Online', 'icon' => 'shopping-bag', 'fields' => ['tienda_online_habilitada', 'tienda_online_sucursal_id', 'tienda_online_reserva_minutos']];
+        if (config('features.tienda_online')) {
+            $tabs['tienda_online'] = ['label' => 'Tienda Online', 'icon' => 'shopping-bag', 'fields' => ['tienda_online_habilitada', 'tienda_online_sucursal_id', 'tienda_online_reserva_minutos']];
+        }
+
         $tabs['descuentos'] = ['label' => 'Descuentos', 'icon' => 'receipt-percent', 'fields' => ['descuento_efectivo_pct', 'descuento_transferencia_pct']];
         $tabs['apariencia'] = ['label' => 'Apariencia', 'icon' => 'paint-brush', 'fields' => ['theme_primary_color', 'theme_secondary_color']];
 

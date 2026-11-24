@@ -1,0 +1,161 @@
+<?php
+
+namespace App\Services\Afip;
+
+use App\Enums\TipoDocumento;
+use App\Exceptions\Afip\AfipConnectionException;
+use App\Exceptions\Afip\AfipRejectedException;
+use App\Exceptions\Afip\AfipValidationException;
+use App\Models\CompanySettings;
+use App\Models\Invoice;
+use App\Services\Afip\Data\CaeRequest;
+use App\Services\Afip\Data\ComprobanteAsociado;
+use App\Support\Afip\ComprobanteResolver;
+use Illuminate\Support\Facades\Cache;
+use RuntimeException;
+
+/**
+ * Único punto de entrada para "emitir esta factura Draft a AFIP". Todo lo
+ * demás (Livewire, tests) le habla a esto, nunca directo al gateway.
+ */
+class InvoiceCaeEmitter
+{
+    public function __construct(private readonly AfipGatewayInterface $gateway) {}
+
+    /**
+     * @throws AfipConnectionException
+     * @throws AfipRejectedException
+     * @throws AfipValidationException
+     */
+    public function emit(Invoice $invoice): Invoice
+    {
+        if ($invoice->isFiscal) {
+            throw new RuntimeException('Esta factura ya tiene CAE, no se puede reemitir.');
+        }
+
+        $company = CompanySettings::current();
+        $client = $invoice->client;
+
+        // El punto de venta a usar es el que ya quedó guardado en la
+        // factura al crearla (elegido a mano, o el único/por defecto de su
+        // sucursal) — nunca se re-deriva acá, porque la sucursal puede
+        // haber sumado o cambiado puntos de venta desde entonces. El
+        // fallback es solo para facturas viejas creadas antes de que
+        // existiera esta columna.
+        $puntoVenta = $invoice->punto_venta ?? $invoice->sucursal?->puntoVentaPorDefecto()?->numero ?? 1;
+
+        // El tipo lo elige el usuario en el switch de Invoices/Create (Remito X /
+        // Factura B / Factura A / Devolución), no se auto-detecta acá.
+        $tipoComprobante = $invoice->tipo_comprobante_interno->aTipoComprobante();
+
+        if ($tipoComprobante === null) {
+            throw new AfipValidationException('Este tipo de documento no se emite a ARCA.');
+        }
+
+        ComprobanteResolver::assertEmisorPuedeForzar($company->condicion_iva, $tipoComprobante);
+
+        if ($tipoComprobante->family() === 'A' && $client->tipo_documento !== TipoDocumento::Cuit) {
+            throw new AfipValidationException("Para {$tipoComprobante->label()} el cliente necesita tener CUIT cargado.");
+        }
+
+        $comprobanteAsociado = null;
+
+        if ($invoice->related_invoice_id !== null) {
+            $original = $invoice->relatedInvoice;
+
+            if ($original->creditedTotal + $invoice->total > $original->total) {
+                throw new AfipValidationException(
+                    'Esta nota de crédito supera el saldo pendiente de la factura original.'
+                );
+            }
+
+            $comprobanteAsociado = new ComprobanteAsociado(
+                tipo: $original->tipo_comprobante,
+                puntoVenta: $original->punto_venta,
+                numero: $original->numero_comprobante_afip,
+            );
+        }
+
+        $condicionIvaReceptorId = ComprobanteResolver::condicionIvaReceptorId($client->condicion_iva);
+
+        // Serializa la asignación de número por punto de venta: "leer
+        // último autorizado + 1 + pedir CAE" tiene que ser una unidad
+        // atómica de nuestro lado, o dos emisiones simultáneas pueden
+        // calcular el mismo próximo número (AFIP rechazaría la segunda,
+        // pero mejor evitarlo antes de gastar una llamada de red).
+        $lock = Cache::lock("afip:emision:{$puntoVenta}", 30);
+
+        $cbteNro = null;
+
+        $caeResponse = $lock->block(10, function () use ($invoice, $puntoVenta, $tipoComprobante, $condicionIvaReceptorId, $comprobanteAsociado, &$cbteNro) {
+            // Re-chequeo por si otra request emitió esta misma factura
+            // mientras esperábamos el lock.
+            if ($invoice->fresh()->cae !== null) {
+                throw new RuntimeException('Esta factura ya tiene CAE, no se puede reemitir.');
+            }
+
+            $cbteNro = $this->gateway->getLastVoucherNumber($puntoVenta, $tipoComprobante) + 1;
+
+            // Desglose del IVA por alícuota (comprobante con alícuotas mezcladas).
+            // Una Factura C (emisor Monotributista/Exento) nunca discrimina
+            // IVA — más allá de que la UI ya no ofrece elegir alícuota por
+            // ítem para esos emisores (ver CompanySettings::
+            // debeOcultarIvaPorItem()), acá se fuerza en el punto de no
+            // retorno: ImpNeto = ImpTotal, ImpIVA = 0, sin desglose de
+            // alícuotas y sin ImpOpEx (ImpOpEx es para operaciones EXENTAS,
+            // un estatus impositivo distinto al de "no discrimino IVA por
+            // monotributo" — no hay que confundirlos aunque ambos terminen
+            // en Factura C).
+            $esFacturaC = $tipoComprobante->family() === 'C';
+
+            $alicuotas = $esFacturaC ? [] : $invoice->ivaPorAlicuota()
+                ->map(fn (array $a) => [
+                    'tasa' => $a['tasa'],
+                    'baseImp' => round($a['base'], 2),
+                    'importe' => round($a['iva'], 2),
+                ])
+                ->all();
+
+            $request = new CaeRequest(
+                puntoVenta: $puntoVenta,
+                tipoComprobante: $tipoComprobante,
+                cbteNro: $cbteNro,
+                docTipo: $invoice->client->tipo_documento->afipCode(),
+                docNro: $this->docNroPara($invoice->client->tipo_documento, $invoice->client->tax_id),
+                impNeto: $esFacturaC ? round((float) $invoice->total, 2) : round((float) $invoice->neto_gravado, 2),
+                impIva: $esFacturaC ? 0.0 : round((float) $invoice->tax_amount, 2),
+                impTotal: round((float) $invoice->total, 2),
+                condicionIvaReceptorId: $condicionIvaReceptorId,
+                impOpEx: $esFacturaC ? 0.0 : round((float) $invoice->neto_exento, 2),
+                alicuotas: $alicuotas,
+                comprobanteAsociado: $comprobanteAsociado,
+            );
+
+            return $this->gateway->requestCae($request);
+        });
+
+        $invoice->forceFill([
+            'cae' => $caeResponse->cae,
+            'cae_vencimiento' => $caeResponse->caeVencimiento,
+            'tipo_comprobante' => $tipoComprobante,
+            'punto_venta' => $puntoVenta,
+            'numero_comprobante_afip' => $cbteNro,
+            'condicion_iva_receptor_id' => $condicionIvaReceptorId,
+            'condicion_iva_emisor' => $company->condicion_iva->value,
+            'afip_observaciones' => $caeResponse->observaciones !== [] ? implode(' | ', $caeResponse->observaciones) : null,
+            'afip_response' => $caeResponse->raw,
+            'emitted_at' => now(),
+        ])->save();
+
+        return $invoice->fresh();
+    }
+
+    private function docNroPara(TipoDocumento $tipo, ?string $taxId): string
+    {
+        if ($tipo === TipoDocumento::SinIdentificar || ! $taxId) {
+            return '0';
+        }
+
+        return preg_replace('/\D/', '', $taxId) ?: '0';
+    }
+}

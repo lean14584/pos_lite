@@ -1,0 +1,140 @@
+<div class="p-8 max-w-6xl mx-auto">
+    <a href="{{ route('purchases.index') }}" wire:navigate class="inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 mb-6">
+        <x-heroicon-o-arrow-left class="w-4 h-4" />
+        Compras
+    </a>
+
+    <x-page-header title="{{ $purchase->number }}" subtitle="Comprada el {{ $purchase->issue_date->format('d/m/Y') }} · Vence el {{ $purchase->due_date->format('d/m/Y') }}" icon="shopping-cart">
+        <x-slot:actions>
+            <x-status-badge :status="$purchase->effective_status" />
+        </x-slot:actions>
+    </x-page-header>
+
+    <div class="flex gap-2 mb-6">
+        <a href="{{ route('purchases.edit', $purchase) }}" wire:navigate class="inline-flex items-center gap-2 rounded-lg border border-gray-300 dark:border-gray-700 px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 shadow-sm hover:bg-gray-50 dark:hover:bg-gray-800 hover:border-gray-400 dark:hover:border-gray-600 hover:shadow-md active:scale-[0.98] transition-all">
+            <x-heroicon-o-pencil class="w-4 h-4" />
+            Editar
+        </a>
+        @if (Auth::user()->esAdminGlobal() || Auth::user()->esEncargado())
+            <button
+                x-on:click="confirmThen('¿Eliminar la compra ' + @js($purchase->number) + '? Esto revertirá el stock sumado por esta compra.', () => $wire.delete())"
+                wire:loading.attr="disabled"
+                wire:target="delete"
+                aria-label="Eliminar compra"
+                class="inline-flex items-center gap-2 rounded-lg border border-gray-300 dark:border-gray-700 px-3 py-2 text-sm font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors disabled:opacity-60"
+            >
+                <x-heroicon-o-trash class="w-4 h-4" />
+            </button>
+        @endif
+    </div>
+
+    <div class="bg-gradient-to-b from-white to-gray-50/60 dark:from-gray-900 dark:to-gray-900/70 rounded-xl border border-gray-200 dark:border-gray-800 shadow-md shadow-gray-200/70 dark:shadow-black/40 p-6 mb-6">
+        <div class="flex items-center gap-3 mb-6">
+            <span class="text-sm font-medium text-gray-700 dark:text-gray-300">Estado:</span>
+            <div class="flex gap-1.5">
+                @foreach ($statuses as $s)
+                    <button
+                        wire:key="status-{{ $s->value }}"
+                        wire:click="setStatus('{{ $s->value }}')"
+                        wire:loading.attr="disabled"
+                        wire:target="setStatus"
+                        class="px-3 py-1 rounded-full text-xs font-medium transition-colors disabled:opacity-50 {{ $purchase->status === $s ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700' }}"
+                    >
+                        {{ $s->label() }}
+                    </button>
+                @endforeach
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-6 pb-6 border-b border-gray-100 dark:border-gray-800">
+            <div>
+                <p class="text-xs uppercase text-gray-400 dark:text-gray-500 mb-1">Comprado a</p>
+                <p class="font-medium text-gray-900 dark:text-gray-100">{{ $purchase->provider->name }}</p>
+                @if ($purchase->provider->email)<p class="text-sm text-gray-500 dark:text-gray-400">{{ $purchase->provider->email }}</p>@endif
+                @if ($purchase->provider->address)<p class="text-sm text-gray-500 dark:text-gray-400">{{ $purchase->provider->address }}</p>@endif
+                @if ($purchase->provider->tax_id)<p class="text-sm text-gray-500 dark:text-gray-400">ID fiscal: {{ $purchase->provider->tax_id }}</p>@endif
+            </div>
+            @if ($purchase->remito_number)
+                <div>
+                    <p class="text-xs uppercase text-gray-400 dark:text-gray-500 mb-1">N° de remito</p>
+                    <p class="font-medium text-gray-900 dark:text-gray-100">{{ $purchase->remito_number }}</p>
+                </div>
+            @endif
+        </div>
+
+        @if ($purchase->sin_detalle)
+            <div class="mb-6 p-4 rounded-lg bg-gray-50 dark:bg-gray-800/40 border border-gray-200 dark:border-gray-800 text-sm text-gray-600 dark:text-gray-400">
+                Compra cargada sin detalle de productos — no movió stock.
+            </div>
+        @else
+        <div class="overflow-x-auto">
+        <table class="w-full text-sm mb-6">
+            <thead>
+                <tr class="text-left text-gray-500 dark:text-gray-400 border-b border-gray-100 dark:border-gray-800 bg-gray-100/80 dark:bg-gray-800/40">
+                    <th class="py-2 font-medium">Descripción</th>
+                    <th class="py-2 font-medium text-right">Cant.</th>
+                    <th class="py-2 font-medium text-right">Precio unit.</th>
+                    <th class="py-2 font-medium text-right">Total</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach ($purchase->items as $item)
+                    <tr class="border-b border-gray-50 dark:border-gray-800/60 last:border-0">
+                        <td class="py-2.5 text-gray-800 dark:text-gray-200">{{ $item->description }}</td>
+                        <td class="py-2.5 text-right text-gray-600 dark:text-gray-400">{{ rtrim(rtrim(number_format($item->quantity, 2), '0'), '.') }}</td>
+                        <td class="py-2.5 text-right text-gray-600 dark:text-gray-400">${{ money($item->unit_price) }}</td>
+                        <td class="py-2.5 text-right font-medium text-gray-900 dark:text-gray-100">${{ money($item->line_total) }}</td>
+                    </tr>
+                @endforeach
+            </tbody>
+        </table>
+        </div>
+        @endif
+
+        <div class="flex justify-end">
+            <div class="w-full max-w-xs space-y-2 text-sm">
+                @if (! $purchase->sin_detalle)
+                    <div class="flex justify-between text-gray-600 dark:text-gray-400">
+                        <span>Subtotal</span>
+                        <span>${{ money($purchase->subtotal) }}</span>
+                    </div>
+                    <div class="flex justify-between text-gray-600 dark:text-gray-400">
+                        <span>Impuesto ({{ $purchase->tax_rate }}%)</span>
+                        <span>${{ money($purchase->tax_amount) }}</span>
+                    </div>
+                    @foreach ($purchase->taxes as $tax)
+                        <div class="flex justify-between text-gray-600 dark:text-gray-400">
+                            <span>{{ $tax->concepto }}</span>
+                            <span>${{ money($tax->amount) }}</span>
+                        </div>
+                    @endforeach
+                @endif
+                <div class="flex justify-between font-semibold text-gray-900 dark:text-gray-100 text-base pt-2 border-t border-gray-200 dark:border-gray-800">
+                    <span>Total</span>
+                    <span>${{ money($purchase->total) }}</span>
+                </div>
+            </div>
+        </div>
+
+        @if ($purchase->payments->isNotEmpty())
+            <div class="mt-6 pt-6 border-t border-gray-100 dark:border-gray-800">
+                <p class="text-xs uppercase text-gray-400 dark:text-gray-500 mb-2">Métodos de pago</p>
+                <div class="space-y-1">
+                    @foreach ($purchase->payments as $payment)
+                        <div class="flex justify-between text-sm">
+                            <span class="text-gray-600 dark:text-gray-400">{{ $payment->method->label() }}</span>
+                            <span class="text-gray-900 dark:text-gray-100 font-medium">${{ money($payment->amount) }}</span>
+                        </div>
+                    @endforeach
+                </div>
+            </div>
+        @endif
+
+        @if ($purchase->notes)
+            <div class="mt-6 pt-6 border-t border-gray-100 dark:border-gray-800">
+                <p class="text-xs uppercase text-gray-400 dark:text-gray-500 mb-1">Notas</p>
+                <p class="text-sm text-gray-600 dark:text-gray-400 whitespace-pre-wrap">{{ $purchase->notes }}</p>
+            </div>
+        @endif
+    </div>
+</div>

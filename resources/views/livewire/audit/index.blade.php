@@ -1,0 +1,165 @@
+@php
+    $eventoLabel = ['created' => 'Alta', 'updated' => 'Modificación', 'deleted' => 'Baja'];
+    $eventoColor = [
+        'created' => 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400',
+        'updated' => 'bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400',
+        'deleted' => 'bg-red-50 text-red-700 dark:bg-red-500/10 dark:text-red-400',
+    ];
+
+    $rutaRegistro = function ($log) {
+        if (! $log->auditable) {
+            return null;
+        }
+
+        return match ($log->auditable_type) {
+            \App\Models\Invoice::class => route('invoices.show', $log->auditable_id),
+            \App\Models\Quote::class => route('quotes.show', $log->auditable_id),
+            \App\Models\Product::class => route('products.edit', $log->auditable_id),
+            \App\Models\Category::class => route('categories.edit', $log->auditable_id),
+            \App\Models\PriceList::class => \Illuminate\Support\Facades\Route::has('price-lists.index') ? route('price-lists.index') : null,
+            \App\Models\Promotion::class => route('promotions.index'),
+            \App\Models\PromotionGroup::class => route('promotions.groups.index'),
+            \App\Models\Client::class => route('clients.edit', $log->auditable_id),
+            \App\Models\Provider::class => route('providers.edit', $log->auditable_id),
+            \App\Models\Purchase::class => route('purchases.show', $log->auditable_id),
+            \App\Models\User::class => route('users.edit', $log->auditable_id),
+            \App\Models\CompanySettings::class => route('company-settings.edit'),
+            default => null,
+        };
+    };
+@endphp
+
+<div class="p-8 max-w-6xl mx-auto">
+    <x-page-header title="Auditoría" subtitle="Altas, bajas y modificaciones en facturas, presupuestos, productos, clientes, proveedores, compras, promociones y usuarios." icon="clipboard-document-check" />
+
+    @php $inputClass = 'w-full rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/60 dark:text-gray-100 px-3 py-2.5 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-400 focus:border-sky-400 transition'; @endphp
+
+    <div class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-5 mb-6">
+        <div class="grid grid-cols-1 sm:grid-cols-5 gap-3">
+            <select wire:model.live="modelo" class="{{ $inputClass }}">
+                <option value="">Todos los modelos</option>
+                @foreach ($tiposAuditados as $clase => $etiqueta)
+                    <option value="{{ $clase }}">{{ $etiqueta }}</option>
+                @endforeach
+            </select>
+            <select wire:model.live="userId" class="{{ $inputClass }}">
+                <option value="">Todos los usuarios</option>
+                @foreach ($usuarios as $usuario)
+                    <option value="{{ $usuario->id }}">{{ $usuario->name }}</option>
+                @endforeach
+            </select>
+            @if ($puedeVerTodasLasSucursales)
+                <select wire:model.live="sucursal_id" class="{{ $inputClass }}">
+                    <option value="">Todas las sucursales</option>
+                    @foreach ($sucursales as $s)
+                        <option value="{{ $s->id }}">{{ $s->name }}</option>
+                    @endforeach
+                </select>
+            @endif
+            <input type="date" wire:model.live="desde" class="{{ $inputClass }}" placeholder="Desde">
+            <input type="date" wire:model.live="hasta" class="{{ $inputClass }}" placeholder="Hasta">
+        </div>
+    </div>
+
+    <div class="border border-gray-200 dark:border-gray-700 rounded-xl overflow-hidden">
+        @if ($logs->isEmpty())
+            <div class="p-12 text-center text-gray-400 dark:text-gray-500">
+                <x-heroicon-o-clipboard-document-check class="w-10 h-10 mx-auto mb-3 text-gray-300 dark:text-gray-700" />
+                <p class="text-sm">No hay actividad registrada con estos filtros.</p>
+            </div>
+        @else
+            <div class="hidden sm:block overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="text-left text-gray-500 dark:text-gray-400 border-b border-gray-100 dark:border-gray-800 bg-gray-50 dark:bg-gray-800/50">
+                        <th class="px-4 py-2 font-medium">Fecha</th>
+                        <th class="px-4 py-2 font-medium">Usuario</th>
+                        @if ($puedeVerTodasLasSucursales)
+                            <th class="px-4 py-2 font-medium">Sucursal</th>
+                        @endif
+                        <th class="px-4 py-2 font-medium">Modelo</th>
+                        <th class="px-4 py-2 font-medium">Evento</th>
+                        <th class="px-4 py-2 font-medium">Cambios</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach ($logs as $log)
+                        <tr wire:key="log-{{ $log->id }}" class="border-b border-gray-50 dark:border-gray-800/60 last:border-0 align-top">
+                            <td class="px-4 py-3 text-gray-500 dark:text-gray-400 whitespace-nowrap">{{ $log->created_at->format('d/m/Y H:i') }}</td>
+                            <td class="px-4 py-3 text-gray-700 dark:text-gray-300">{{ $log->user->name ?? 'Sistema' }}</td>
+                            @if ($puedeVerTodasLasSucursales)
+                                <td class="px-4 py-3 text-gray-500 dark:text-gray-400">{{ $log->sucursal->name ?? '—' }}</td>
+                            @endif
+                            <td class="px-4 py-3 text-gray-700 dark:text-gray-300">
+                                @if ($rutaRegistro($log))
+                                    <a href="{{ $rutaRegistro($log) }}" wire:navigate class="text-sky-700 dark:text-sky-400 hover:underline">
+                                        {{ \App\Models\AuditLog::etiquetaModelo($log->auditable_type) }} #{{ $log->auditable_id }}
+                                    </a>
+                                @else
+                                    {{ \App\Models\AuditLog::etiquetaModelo($log->auditable_type) }} #{{ $log->auditable_id }}
+                                @endif
+                            </td>
+                            <td class="px-4 py-3">
+                                <span class="px-2 py-0.5 rounded-full text-xs font-medium {{ $eventoColor[$log->event] }}">
+                                    {{ $eventoLabel[$log->event] }}
+                                </span>
+                            </td>
+                            <td class="px-4 py-3 text-gray-600 dark:text-gray-400">
+                                <div class="space-y-0.5">
+                                    @foreach ($log->changes as $campo => $valores)
+                                        <div>
+                                            <span class="text-gray-400 dark:text-gray-500">{{ $campo }}:</span>
+                                            {{ $valores['old'] ?? '—' }} → {{ $valores['new'] ?? '—' }}
+                                        </div>
+                                    @endforeach
+                                </div>
+                            </td>
+                        </tr>
+                    @endforeach
+                </tbody>
+            </table>
+            </div>
+
+            <div class="sm:hidden divide-y divide-gray-100 dark:divide-gray-800">
+                @foreach ($logs as $log)
+                    <div wire:key="log-mobile-{{ $log->id }}" class="p-4">
+                        <div class="flex items-start justify-between gap-3">
+                            <p class="text-gray-700 dark:text-gray-300">
+                                @if ($rutaRegistro($log))
+                                    <a href="{{ $rutaRegistro($log) }}" wire:navigate class="text-sky-700 dark:text-sky-400 hover:underline">
+                                        {{ \App\Models\AuditLog::etiquetaModelo($log->auditable_type) }} #{{ $log->auditable_id }}
+                                    </a>
+                                @else
+                                    {{ \App\Models\AuditLog::etiquetaModelo($log->auditable_type) }} #{{ $log->auditable_id }}
+                                @endif
+                            </p>
+                            <span class="px-2 py-0.5 rounded-full text-xs font-medium shrink-0 {{ $eventoColor[$log->event] }}">
+                                {{ $eventoLabel[$log->event] }}
+                            </span>
+                        </div>
+                        <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                            {{ $log->created_at->format('d/m/Y H:i') }} · {{ $log->user->name ?? 'Sistema' }}
+                            @if ($puedeVerTodasLasSucursales)
+                                · {{ $log->sucursal->name ?? '—' }}
+                            @endif
+                        </p>
+                        @if (count($log->changes) > 0)
+                            <div class="text-xs text-gray-600 dark:text-gray-400 mt-1.5 space-y-0.5">
+                                @foreach ($log->changes as $campo => $valores)
+                                    <div>
+                                        <span class="text-gray-400 dark:text-gray-500">{{ $campo }}:</span>
+                                        {{ $valores['old'] ?? '—' }} → {{ $valores['new'] ?? '—' }}
+                                    </div>
+                                @endforeach
+                            </div>
+                        @endif
+                    </div>
+                @endforeach
+            </div>
+
+            <div class="p-4 border-t border-gray-100 dark:border-gray-800">
+                {{ $logs->links() }}
+            </div>
+        @endif
+    </div>
+</div>

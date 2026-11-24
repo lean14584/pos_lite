@@ -1,0 +1,342 @@
+<?php
+
+use App\Http\Controllers\Auth\LogoutController;
+use App\Http\Controllers\BackupDownloadController;
+use App\Http\Controllers\CategoryProductsPdfController;
+use App\Http\Controllers\ClientAccountStatementController;
+use App\Http\Controllers\InvoicePdfController;
+use App\Http\Controllers\LibroIvaExportController;
+use App\Http\Controllers\MercadoPagoWebhookController;
+use App\Http\Controllers\ProductExportController;
+use App\Http\Controllers\PromotionPosterController;
+use App\Http\Controllers\ProviderAccountStatementController;
+use App\Http\Controllers\ReciboPdfController;
+use App\Http\Controllers\RemitoPdfController;
+use App\Http\Controllers\ReportsExportController;
+use App\Http\Controllers\StockTransferPdfController;
+use App\Http\Controllers\TicketEscPosController;
+use App\Http\Controllers\TicketImageController;
+use App\Http\Controllers\TicketPrintController;
+use App\Http\Controllers\TiendaLogoutController;
+use App\Http\Controllers\TiendanubeWebhookController;
+use App\Livewire\Audit\Index as AuditIndex;
+use App\Livewire\Auth\ForgotPassword;
+use App\Livewire\Auth\Login;
+use App\Livewire\Auth\ResetPassword;
+use App\Livewire\CashRegister\Index as CashRegisterIndex;
+use App\Livewire\Categories\Create as CategoryCreate;
+use App\Livewire\Categories\Edit as CategoryEdit;
+use App\Livewire\Categories\Index as CategoryIndex;
+use App\Livewire\Clients\Account as ClientAccount;
+use App\Livewire\Clients\Create as ClientCreate;
+use App\Livewire\Clients\Edit as ClientEdit;
+use App\Livewire\Clients\Import as ClientImport;
+use App\Livewire\Clients\ImportSaldo as ClientImportSaldo;
+use App\Livewire\Clients\Index as ClientIndex;
+use App\Livewire\CompanySettings\Edit as CompanySettingsEdit;
+use App\Livewire\Dashboard;
+use App\Livewire\HistoricalSales\Import as HistoricalSaleImport;
+use App\Livewire\HistoricalSales\Index as HistoricalSaleIndex;
+use App\Livewire\Invoices\Create as InvoiceCreate;
+use App\Livewire\Invoices\Edit as InvoiceEdit;
+use App\Livewire\Invoices\FacturarRemito;
+use App\Livewire\Invoices\Index as InvoiceIndex;
+use App\Livewire\Invoices\Show as InvoiceShow;
+use App\Livewire\LibroIva\Index as LibroIvaIndex;
+use App\Livewire\Messages\Index as MessagesIndex;
+use App\Livewire\NotasCredito\Create as NotaCreditoCreate;
+use App\Livewire\PedidosOnline\Index as PedidosOnlineIndex;
+use App\Livewire\Pos\Index;
+use App\Livewire\PriceCheck\Kiosk;
+use App\Livewire\Products\Create as ProductCreate;
+use App\Livewire\Products\Edit as ProductEdit;
+use App\Livewire\Products\Historial;
+use App\Livewire\Products\Import;
+use App\Livewire\Products\Index as ProductIndex;
+use App\Livewire\Products\Labels;
+use App\Livewire\Providers\Account as ProviderAccount;
+use App\Livewire\Providers\Create as ProviderCreate;
+use App\Livewire\Providers\Edit as ProviderEdit;
+use App\Livewire\Providers\Import as ProviderImport;
+use App\Livewire\Providers\ImportSaldo as ProviderImportSaldo;
+use App\Livewire\Providers\Index as ProviderIndex;
+use App\Livewire\Purchases\Create as PurchaseCreate;
+use App\Livewire\Purchases\Edit as PurchaseEdit;
+use App\Livewire\Purchases\Index as PurchaseIndex;
+use App\Livewire\Purchases\Show as PurchaseShow;
+use App\Livewire\Purchases\Suggestions as PurchaseSuggestions;
+use App\Livewire\Quotes\Create as QuoteCreate;
+use App\Livewire\Quotes\Edit as QuoteEdit;
+use App\Livewire\Quotes\Index as QuoteIndex;
+use App\Livewire\Quotes\Show as QuoteShow;
+use App\Livewire\Reports\Index as ReportsIndex;
+use App\Livewire\StockTransfers\Show;
+use App\Livewire\Sucursales\Create as SucursalCreate;
+use App\Livewire\Sucursales\Edit as SucursalEdit;
+use App\Livewire\Sucursales\Index as SucursalIndex;
+use App\Livewire\Tasks\Create as TaskCreate;
+use App\Livewire\Tasks\Index as TaskIndex;
+use App\Livewire\Tienda\Account\ForgotPassword as TiendaAccountForgotPassword;
+use App\Livewire\Tienda\Account\Login as TiendaAccountLogin;
+use App\Livewire\Tienda\Account\Orders as TiendaAccountOrders;
+use App\Livewire\Tienda\Account\Register as TiendaAccountRegister;
+use App\Livewire\Tienda\Account\ResetPassword as TiendaAccountResetPassword;
+use App\Livewire\Tienda\Cart as TiendaCart;
+use App\Livewire\Tienda\Catalog as TiendaCatalog;
+use App\Livewire\Tienda\Checkout as TiendaCheckout;
+use App\Livewire\Tienda\OrderStatus as TiendaOrderStatus;
+use App\Livewire\Tienda\ProductDetail as TiendaProductDetail;
+use App\Livewire\Users\Create as UserCreate;
+use App\Livewire\Users\Edit as UserEdit;
+use App\Livewire\Users\Index as UserIndex;
+use Illuminate\Support\Facades\Route;
+
+Route::get('/login', Login::class)->middleware('guest')->name('login');
+Route::post('/logout', LogoutController::class)->middleware('auth')->name('logout');
+
+Route::middleware('guest')->group(function () {
+    Route::get('/forgot-password', ForgotPassword::class)->name('password.request');
+    Route::get('/reset-password/{token}', ResetPassword::class)->name('password.reset');
+});
+
+// Webhook público de Mercado Pago (sin auth ni CSRF; se valida contra la API).
+// throttle: la firma se valida barato, pero son 2 endpoints 100% públicos
+// sin ningún límite de tasa hasta ahora.
+Route::match(['get', 'post'], '/mp/webhook', MercadoPagoWebhookController::class)->middleware('throttle:60,1')->name('mp.webhook');
+
+// Webhook público de Tiendanube (sin auth ni CSRF; firma HMAC opcional).
+Route::post('/tiendanube/webhook', TiendanubeWebhookController::class)->middleware('throttle:60,1')->name('tiendanube.webhook');
+
+// Kiosco público de consulta de precios (para dejar fijo en el salón).
+// {sucursal} opcional: en una instalación multisucursal, cada pantalla física
+// se puede pinnear a SU sucursal con /precios/{id} para mostrar el stock real
+// de ese local — sin esto, mostraba el stock agregado de TODAS las
+// sucursales (ver Kiosk::search()).
+Route::get('/precios/{sucursal?}', Kiosk::class)->name('precios');
+
+// Tienda online pública: mismo Product/Category/stock que el POS, sin paso
+// de sincronización. Apagada por defecto por cliente (tienda.enabled lee
+// CompanySettings::current()->tienda_online_habilitada y devuelve 404 si
+// no está prendida — ver EnsureTiendaOnlineHabilitada).
+Route::middleware('tienda.enabled')->prefix('tienda')->name('tienda.')->group(function () {
+    Route::get('/', TiendaCatalog::class)->name('catalog');
+    Route::get('/producto/{product}', TiendaProductDetail::class)->name('product');
+    Route::get('/carrito', TiendaCart::class)->name('cart');
+    Route::get('/checkout', TiendaCheckout::class)->name('checkout');
+    Route::get('/pedido/{token}', TiendaOrderStatus::class)->name('order-status');
+
+    // Cuenta de cliente (guard `customer`, independiente del guard `web` de
+    // staff — ver app/Models/Customer.php y config/auth.php).
+    Route::prefix('cuenta')->name('account.')->group(function () {
+        Route::middleware('guest:customer')->group(function () {
+            Route::get('/ingresar', TiendaAccountLogin::class)->name('login');
+            Route::get('/registro', TiendaAccountRegister::class)->name('register');
+            Route::get('/olvide-password', TiendaAccountForgotPassword::class)->name('forgot-password');
+            Route::get('/reset-password/{token}', TiendaAccountResetPassword::class)->name('reset-password');
+        });
+
+        Route::middleware('auth:customer')->group(function () {
+            Route::post('/salir', TiendaLogoutController::class)->name('logout');
+            Route::get('/pedidos', TiendaAccountOrders::class)->name('orders');
+        });
+    });
+});
+
+// Ticket ESC/POS para el agente de impresión local (ver pos-print-agent/):
+// sin auth porque el agente no tiene sesión de navegador. La URL firmada
+// (URL::temporarySignedRoute, vence en minutos) es la que autoriza el
+// acceso, generada server-side solo para el usuario que ya vio la factura.
+Route::get('/invoices/{invoice}/ticket.escpos', TicketEscPosController::class)
+    ->middleware('signed')
+    ->name('invoices.ticket-escpos');
+
+Route::middleware('auth')->group(function () {
+    Route::get('/', Dashboard::class)->name('dashboard');
+
+    Route::middleware('module:pos')->get('pos', Index::class)->name('pos.index');
+
+    Route::middleware('module:quotes')->prefix('quotes')->name('quotes.')->group(function () {
+        Route::get('/', QuoteIndex::class)->name('index');
+        Route::get('/new', QuoteCreate::class)->name('create');
+        Route::get('/{quote}', QuoteShow::class)->name('show');
+        Route::get('/{quote}/edit', QuoteEdit::class)->name('edit');
+    });
+
+    Route::middleware('module:invoices')->prefix('invoices')->name('invoices.')->group(function () {
+        Route::get('/', InvoiceIndex::class)->name('index');
+        if (config('features.invoices_manual_create')) {
+            Route::get('/new', InvoiceCreate::class)->name('create');
+        }
+        Route::get('/{invoice}', InvoiceShow::class)->name('show');
+        Route::get('/{invoice}/edit', InvoiceEdit::class)->name('edit');
+        Route::get('/{invoice}/pdf', InvoicePdfController::class)->name('pdf');
+        Route::get('/{invoice}/ticket', TicketPrintController::class)->name('ticket-print');
+        Route::get('/{invoice}/ticket.png', TicketImageController::class)->name('ticket-image');
+        Route::get('/{invoice}/remito-pdf', RemitoPdfController::class)->name('remito-pdf');
+        Route::get('/{invoice}/facturar', FacturarRemito::class)->name('facturar-remito');
+        Route::get('/{invoice}/nota-credito', NotaCreditoCreate::class)->name('nota-credito.create');
+    });
+
+    Route::middleware('module:invoices')->get('pedidos-online', PedidosOnlineIndex::class)->name('pedidos-online.index');
+
+    Route::middleware('module:clients')->prefix('clients')->name('clients.')->group(function () {
+        Route::get('/', ClientIndex::class)->name('index');
+        Route::get('/new', ClientCreate::class)->name('create');
+        Route::get('/{client}/edit', ClientEdit::class)->name('edit');
+        Route::get('/{client}/account', ClientAccount::class)->name('account');
+        Route::get('/{client}/estado-cuenta', ClientAccountStatementController::class)->name('statement');
+        Route::get('/recibo/{payment}', ReciboPdfController::class)->name('recibo');
+    });
+
+    Route::middleware('module:data-import')->prefix('clients')->name('clients.')->group(function () {
+        Route::get('/importar', ClientImport::class)->name('import');
+        Route::get('/importar-saldo', ClientImportSaldo::class)->name('import-saldo');
+    });
+
+    if (config('features.historical_sales')) {
+        Route::middleware('module:data-import')->prefix('ventas-historicas')->name('historical-sales.')->group(function () {
+            Route::get('/', HistoricalSaleIndex::class)->name('index');
+            Route::get('/importar', HistoricalSaleImport::class)->name('import');
+        });
+    }
+
+    Route::middleware('module:cobranzas')->get('cobranzas', App\Livewire\Cobranzas\Index::class)->name('cobranzas.index');
+
+    Route::middleware('module:products')->prefix('products')->name('products.')->group(function () {
+        Route::get('/', ProductIndex::class)->name('index');
+    });
+
+    Route::middleware('module:products-manage')->prefix('products')->name('products.')->group(function () {
+        Route::get('/new', ProductCreate::class)->name('create');
+        Route::get('/etiquetas', Labels::class)->name('labels');
+        Route::get('/importar', Import::class)->name('import');
+        Route::get('/exportar', ProductExportController::class)->name('export');
+        Route::get('/{product}/edit', ProductEdit::class)->name('edit');
+        Route::get('/{product}/historial', Historial::class)->name('historial');
+    });
+
+    Route::middleware('module:stock-adjustments')->get('ajustes-stock', App\Livewire\StockAdjustments\Index::class)->name('stock-adjustments.index');
+
+    if (config('features.stock_transfers')) {
+        Route::middleware('module:stock-transfers')->prefix('envios-mercaderia')->name('stock-transfers.')->group(function () {
+            Route::get('/', App\Livewire\StockTransfers\Index::class)->name('index');
+            Route::get('/{transfer}', Show::class)->name('show');
+            Route::get('/{transfer}/pdf', StockTransferPdfController::class)->name('pdf');
+        });
+    }
+
+    if (config('features.product_batches')) {
+        Route::middleware('module:product-batches')->get('lotes-vencimientos', App\Livewire\ProductBatches\Index::class)->name('product-batches.index');
+    }
+
+    Route::middleware('module:categories')->prefix('categories')->name('categories.')->group(function () {
+        Route::get('/', CategoryIndex::class)->name('index');
+        Route::get('/new', CategoryCreate::class)->name('create');
+        Route::get('/{category}/edit', CategoryEdit::class)->name('edit');
+        Route::get('/{category}/pdf', CategoryProductsPdfController::class)->name('pdf');
+    });
+
+    if (config('features.price_lists')) {
+        Route::middleware('module:price-lists')->prefix('price-lists')->name('price-lists.')->group(function () {
+            Route::get('/', App\Livewire\PriceLists\Index::class)->name('index');
+        });
+    }
+
+    Route::middleware('module:promotions')->prefix('promociones')->name('promotions.')->group(function () {
+        Route::get('/', App\Livewire\Promotions\Index::class)->name('index');
+        Route::get('/familias', App\Livewire\PromotionGroups\Index::class)->name('groups.index');
+        Route::get('/cartel', PromotionPosterController::class)->name('poster');
+    });
+
+    Route::middleware('module:discounts')->prefix('mis-descuentos')->name('discounts.')->group(function () {
+        Route::get('/', App\Livewire\Discounts\Index::class)->name('index');
+    });
+
+    Route::middleware('module:providers')->prefix('providers')->name('providers.')->group(function () {
+        Route::get('/', ProviderIndex::class)->name('index');
+        Route::get('/new', ProviderCreate::class)->name('create');
+        Route::get('/{provider}/edit', ProviderEdit::class)->name('edit');
+        Route::get('/{provider}/account', ProviderAccount::class)->name('account');
+        Route::get('/{provider}/estado-cuenta', ProviderAccountStatementController::class)->name('statement');
+    });
+
+    Route::middleware('module:data-import')->prefix('providers')->name('providers.')->group(function () {
+        Route::get('/importar', ProviderImport::class)->name('import');
+        Route::get('/importar-saldo', ProviderImportSaldo::class)->name('import-saldo');
+    });
+
+    Route::middleware('module:purchases')->prefix('purchases')->name('purchases.')->group(function () {
+        Route::get('/', PurchaseIndex::class)->name('index');
+        Route::get('/new', PurchaseCreate::class)->name('create');
+        Route::get('/suggestions', PurchaseSuggestions::class)->name('suggestions');
+        Route::get('/{purchase}', PurchaseShow::class)->name('show');
+        Route::get('/{purchase}/edit', PurchaseEdit::class)->name('edit');
+    });
+
+    Route::middleware('module:cash-register')->prefix('cash-register')->name('cash-register.')->group(function () {
+        Route::get('/', CashRegisterIndex::class)->name('index');
+    });
+
+    if (config('features.vencimientos_finanzas')) {
+        Route::middleware('module:vencimientos')->get('vencimientos', App\Livewire\Vencimientos\Index::class)->name('vencimientos.index');
+    }
+
+    Route::middleware('module:reports')->prefix('reports')->name('reports.')->group(function () {
+        Route::get('/', ReportsIndex::class)->name('index');
+        Route::get('/export/pdf', [ReportsExportController::class, 'pdf'])->name('export.pdf');
+        Route::get('/export/csv', [ReportsExportController::class, 'csv'])->name('export.csv');
+    });
+
+    Route::middleware('module:users')->prefix('users')->name('users.')->group(function () {
+        Route::get('/', UserIndex::class)->name('index');
+        Route::get('/new', UserCreate::class)->name('create');
+        Route::get('/{user}/edit', UserEdit::class)->name('edit');
+    });
+
+    Route::middleware('module:messages')->prefix('messages')->name('messages.')->group(function () {
+        Route::get('/{with?}', MessagesIndex::class)->name('index');
+    });
+
+    Route::middleware('module:tasks')->prefix('tasks')->name('tasks.')->group(function () {
+        Route::get('/', TaskIndex::class)->name('index');
+        Route::get('/new', TaskCreate::class)->name('create');
+    });
+
+    Route::middleware('module:company-settings')->prefix('company-settings')->name('company-settings.')->group(function () {
+        Route::get('/', CompanySettingsEdit::class)->name('edit');
+    });
+
+    if (config('features.tiendanube')) {
+        Route::middleware('module:company-settings')->prefix('tiendanube')->name('tiendanube.')->group(function () {
+            Route::get('/', App\Livewire\Tiendanube\Index::class)->name('index');
+        });
+    }
+
+    // El ABM completo (listar/crear sucursales) solo tiene sentido con
+    // multisucursal prendido. La edición de UNA sucursal puntual —que
+    // incluye el ABM de Mercado Pago y puntos de venta, ver Sucursales\Edit—
+    // tiene que quedar accesible siempre: con este bloque entero gateado
+    // detrás de multisucursal, un cliente de una sola sucursal ("Principal")
+    // no tenía NINGUNA forma de cargar sus credenciales de MP desde la UI.
+    Route::middleware('module:sucursales')->prefix('sucursales')->name('sucursales.')->group(function () {
+        if (config('features.multisucursal')) {
+            Route::get('/', SucursalIndex::class)->name('index');
+            Route::get('/new', SucursalCreate::class)->name('create');
+        }
+        Route::get('/{sucursal}/edit', SucursalEdit::class)->name('edit');
+    });
+
+    Route::middleware('module:audit')->get('auditoria', AuditIndex::class)->name('audit.index');
+
+    Route::middleware('module:backups')->prefix('respaldo')->name('backups.')->group(function () {
+        Route::get('/', App\Livewire\Backups\Index::class)->name('index');
+        Route::get('/descargar', BackupDownloadController::class)->name('download');
+    });
+
+    Route::middleware('module:health')->get('estado', App\Livewire\Health\Index::class)->name('health.index');
+
+    Route::middleware('module:libro-iva')->prefix('libro-iva')->name('libro-iva.')->group(function () {
+        Route::get('/', LibroIvaIndex::class)->name('index');
+        Route::get('/export', LibroIvaExportController::class)->name('export');
+    });
+});

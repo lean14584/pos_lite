@@ -1,0 +1,103 @@
+<?php
+
+namespace App\Support;
+
+/**
+ * EAN13 a partir del campo "código" (sku) del producto, para poder
+ * escanearlo en el POS en vez de tipearlo (ver Pos\Index::addByBarcode()).
+ * Dos casos:
+ * - El sku ya es un código real de fábrica de 13 dígitos con checksum
+ *   válido: se usa tal cual, no se inventa nada.
+ * - El sku es un código interno corto (ej. "9876"): se completa con ceros
+ *   a la izquierda hasta 12 dígitos y se calcula el dígito verificador.
+ *   No es un GTIN registrado, es solo para que el lector del POS lo pueda
+ *   leer — Pos\Index::addByBarcode() sabe recuperar el sku original.
+ */
+class Ean13
+{
+    public static function fromSku(?string $sku): ?string
+    {
+        if ($sku === null || $sku === '' || ! ctype_digit($sku)) {
+            return null;
+        }
+
+        // Un código de 13 dígitos con checksum válido es un GTIN real de
+        // fábrica: se usa tal cual, sin tocarlo.
+        if (strlen($sku) === 13 && self::isValid($sku)) {
+            return $sku;
+        }
+
+        // Cualquier otro caso (corto, o "paddeado" a mano hasta 13 dígitos
+        // pero sin checksum válido) se trata como código interno: se toman
+        // los dígitos significativos (sin los ceros a la izquierda) y se
+        // vuelve a paddear + calcular el dígito verificador. Así un sku
+        // tipeado como "0000000000001" no queda sin código de barras solo
+        // por tener la pinta de un EAN13 sin serlo.
+        $significant = ltrim($sku, '0');
+        if ($significant === '') {
+            $significant = '0';
+        }
+
+        if (strlen($significant) > 12) {
+            return null;
+        }
+
+        $base = str_pad($significant, 12, '0', STR_PAD_LEFT);
+
+        return $base.self::checkDigit($base);
+    }
+
+    /**
+     * Recupera el sku "corto" de un código escaneado con el esquema de
+     * ceros a la izquierda de arriba. Null si el checksum no da (no es un
+     * EAN13 válido, sea del esquema que sea).
+     */
+    public static function stripPadding(string $code): ?string
+    {
+        if (! self::isValid($code)) {
+            return null;
+        }
+
+        return ltrim(substr($code, 0, 12), '0') ?: '0';
+    }
+
+    /**
+     * Reconstruye el EAN13 completo cuando el lector lo transmitió como su
+     * equivalente UPC-A: un EAN13 que arranca con '0' (nuestro esquema de
+     * sku corto siempre arranca así, por el padding) es, dígito a dígito, un
+     * código UPC-A de 12 dígitos con un '0' de sistema numérico adelante —
+     * muchos lectores detectan esto y mandan directamente los 12 dígitos del
+     * UPC-A en vez del EAN13 completo (conversión estándar, no un error del
+     * lector). Se antepone el '0' y se valida el checksum para confirmar que
+     * el código realmente encajaba en este esquema antes de buscar nada.
+     */
+    public static function reconstruirDesdeUpcA(string $upcA): ?string
+    {
+        if (strlen($upcA) !== 12 || ! ctype_digit($upcA)) {
+            return null;
+        }
+
+        $ean13 = '0'.$upcA;
+
+        return self::isValid($ean13) ? $ean13 : null;
+    }
+
+    /** Checksum estándar EAN13: dígitos impares (1ro, 3ro...) peso 1, pares peso 3, sobre los primeros 12. */
+    public static function checkDigit(string $twelveDigits): string
+    {
+        $sum = 0;
+
+        foreach (str_split($twelveDigits) as $i => $digit) {
+            $sum += (int) $digit * ($i % 2 === 0 ? 1 : 3);
+        }
+
+        return (string) ((10 - ($sum % 10)) % 10);
+    }
+
+    public static function isValid(string $code): bool
+    {
+        return strlen($code) === 13
+            && ctype_digit($code)
+            && self::checkDigit(substr($code, 0, 12)) === substr($code, 12, 1);
+    }
+}

@@ -1,0 +1,269 @@
+<?php
+
+namespace App\Livewire\Purchases;
+
+use App\Enums\InvoiceStatus;
+use App\Enums\PaymentMethod;
+use App\Enums\TipoComprobante;
+use App\Livewire\Purchases\Concerns\ManagesPurchaseLines;
+use App\Models\Product;
+use App\Models\ProductBatch;
+use App\Models\Provider;
+use App\Models\Purchase;
+use App\Support\CashLinker;
+use App\Support\CurrentSucursal;
+use App\Support\StockAdjuster;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+
+#[Layout('layouts.app')]
+class Edit extends Component
+{
+    use ManagesPurchaseLines;
+
+    public Purchase $purchase;
+
+    public string $provider_id = '';
+
+    public string $tipo_comprobante = '1';
+
+    public string $punto_venta = '1';
+
+    public string $numero_comprobante = '';
+
+    public string $issue_date;
+
+    public string $due_date;
+
+    public string $tax_rate = '0';
+
+    public string $notes = '';
+
+    public string $status = 'draft';
+
+    public bool $sin_detalle = false;
+
+    public string $manual_total = '';
+
+    public string $remito_number = '';
+
+    /** @var array<int, array{product_id: int, description: string, quantity: string, unit_price: string}> */
+    public array $items = [];
+
+    /** @var array<int, array{method: string, amount: string}> */
+    public array $payments = [];
+
+    /** @var array<int, array{concepto: string, amount: string}> */
+    public array $taxes = [];
+
+    public string $productQuery = '';
+
+    public string $providerQuery = '';
+
+    public bool $submitted = false;
+
+    public function mount(Purchase $purchase): void
+    {
+        abort_unless(
+            Auth::user()?->esAdminGlobal() || $purchase->sucursal_id === CurrentSucursal::id(),
+            403,
+            'No tenés acceso a esta compra.'
+        );
+
+        $this->purchase = $purchase;
+        $this->provider_id = (string) $purchase->provider_id;
+        $this->tipo_comprobante = (string) ($purchase->tipo_comprobante?->value ?? TipoComprobante::FacturaA->value);
+        $this->punto_venta = (string) ($purchase->punto_venta ?? 1);
+        $this->numero_comprobante = (string) ($purchase->numero_comprobante ?? 1);
+        $this->issue_date = $purchase->issue_date->toDateString();
+        $this->due_date = $purchase->due_date->toDateString();
+        $this->tax_rate = (string) $purchase->tax_rate;
+        $this->notes = (string) $purchase->notes;
+        $this->status = $purchase->status->value;
+        // ?? false: igual que punto_venta/tipo_comprobante más abajo — un
+        // Purchase recién creado en memoria (sin fresh()) no trae este
+        // atributo cargado, y el cast primitivo de Eloquent devuelve null
+        // en vez del default de la columna cuando el valor crudo falta.
+        $this->sin_detalle = $purchase->sin_detalle ?? false;
+        $this->manual_total = $purchase->manual_total !== null ? (string) $purchase->manual_total : '';
+        $this->remito_number = (string) $purchase->remito_number;
+
+        $this->items = $purchase->items->map(fn ($item) => [
+            'product_id' => $item->product_id,
+            'description' => $item->description,
+            'quantity' => (string) $item->quantity,
+            'unit_price' => (string) $item->unit_price,
+        ])->all();
+
+        $this->payments = $purchase->payments->map(fn ($payment) => [
+            'method' => $payment->method->value,
+            'amount' => (string) $payment->amount,
+        ])->all();
+
+        $this->taxes = $purchase->taxes->map(fn ($tax) => [
+            'concepto' => $tax->concepto,
+            'amount' => (string) $tax->amount,
+        ])->all();
+    }
+
+    // MEJORA: a diferencia de Purchases\Create (que usa Cache::lock +
+    // $submitted), este save() no tenía ninguna protección contra
+    // doble-submit - dos requests casi simultáneas (doble click, dos
+    // pestañas) podían correr el mismo DB::transaction en paralelo, cada
+    // una revirtiendo/reaplicando stock y desvinculando/vinculando pagos
+    // por su cuenta, duplicando ajustes de stock y movimientos de caja.
+    public function save(): void
+    {
+        Cache::lock('purchases:edit:'.$this->purchase->id, 10)->block(5, fn () => $this->saveInterno());
+    }
+
+    private function saveInterno(): void
+    {
+        if ($this->submitted) {
+            return;
+        }
+
+        $this->validate([
+            'provider_id' => ['required', 'exists:providers,id'],
+            'tipo_comprobante' => ['required', Rule::enum(TipoComprobante::class)],
+            'punto_venta' => ['required', 'integer', 'min:1', 'max:9999'],
+            'numero_comprobante' => ['required', 'integer', 'min:1', 'max:99999999'],
+            'issue_date' => ['required', 'date'],
+            'due_date' => ['required', 'date'],
+            'tax_rate' => ['required', 'numeric', 'min:0'],
+            'status' => ['required'],
+            'notes' => ['nullable', 'string'],
+            'remito_number' => ['nullable', 'string', 'max:60'],
+            'manual_total' => [$this->sin_detalle ? 'required' : 'nullable', 'numeric', 'min:0.01'],
+            'items.*.quantity' => ['required', 'numeric', 'min:0.01'],
+            'items.*.unit_price' => ['required', 'numeric', 'min:0'],
+            'taxes.*.concepto' => ['required_with:taxes.*.amount', 'nullable', 'string', 'max:100'],
+            'taxes.*.amount' => ['nullable', 'numeric', 'min:0'],
+        ]);
+
+        if (! $this->sin_detalle && empty($this->items)) {
+            $this->addError('items', 'Agregá al menos un producto, o marcá "Compra sin detalle" si no vas a cargar productos.');
+
+            return;
+        }
+
+        // La sucursal de la compra no se re-deriva acá: es la que ya quedó
+        // guardada al crearla (ver Purchases\Create), no la sucursal activa
+        // de quien la esté editando ahora — si no, un admin que cambió de
+        // sucursal terminaría revirtiendo/reaplicando el stock (y el pago)
+        // en el local equivocado.
+        $sucursalId = $this->purchase->sucursal_id;
+
+        // Si se va a registrar un pago, tiene que quedar anotado en una caja
+        // abierta — si no, la plata que sale queda invisible para el arqueo
+        // (CashLinker::linkPurchasePayment() no avisa, solo no hace nada).
+        $registraMovimientoDeCaja = collect($this->payments)->contains(fn ($p) => (float) $p['amount'] > 0);
+
+        if ($registraMovimientoDeCaja && ! CashLinker::hasOpenSession($sucursalId)) {
+            $this->addError('payments', 'Tenés que abrir la caja antes de registrar un pago.');
+
+            return;
+        }
+
+        // MEJORA: esta pantalla no muestra (ni deja tocar) lote/vencimiento
+        // de los ítems — cambiarle la cantidad a un producto que sí tiene un
+        // lote cargado (ver Purchases\Create) dejaba el lote desincronizado
+        // del stock real: ProductBatch::quantity_remaining seguía con el
+        // valor viejo, y darlo de baja después descontaba stock que ya no
+        // existía. Se bloquea el cambio de cantidad en esos ítems puntuales
+        // en vez de intentar recalcular el lote a ciegas acá.
+        $productosConLote = ProductBatch::where('purchase_id', $this->purchase->id)
+            ->pluck('quantity_received', 'product_id');
+
+        if ($productosConLote->isNotEmpty()) {
+            $cantidadNuevaPorProducto = collect($this->items)
+                ->groupBy('product_id')
+                ->map(fn ($grupo) => $grupo->sum(fn ($item) => (float) $item['quantity']));
+
+            foreach ($productosConLote as $productId => $cantidadOriginal) {
+                $cantidadNueva = (float) ($cantidadNuevaPorProducto[$productId] ?? 0);
+
+                if (abs($cantidadNueva - (float) $cantidadOriginal) > 0.009) {
+                    $nombre = Product::find($productId)?->name ?? "producto #{$productId}";
+                    $this->addError('items', "\"{$nombre}\" tiene un lote cargado — no se puede cambiar su cantidad desde acá. Corregilo desde Lotes y Vencimientos o Ajustes de Stock.");
+
+                    return;
+                }
+            }
+        }
+
+        // Recién acá, pasadas todas las validaciones: una falla de
+        // validación legítima no debe dejar al usuario sin poder reintentar.
+        $this->submitted = true;
+
+        DB::transaction(function () use ($sucursalId) {
+            // Reverse the stock impact of the items as they were before this edit.
+            $previousItems = $this->purchase->items->map(fn ($item) => [
+                'product_id' => $item->product_id,
+                'quantity' => (float) $item->quantity,
+            ])->all();
+            StockAdjuster::apply($previousItems, -1, $sucursalId);
+
+            $this->purchase->update([
+                'provider_id' => $this->provider_id,
+                'tipo_comprobante' => $this->tipo_comprobante,
+                'punto_venta' => $this->punto_venta,
+                'numero_comprobante' => $this->numero_comprobante,
+                'issue_date' => $this->issue_date,
+                'due_date' => $this->due_date,
+                'tax_rate' => $this->tax_rate,
+                'notes' => $this->notes ?: null,
+                'status' => $this->status,
+                'sin_detalle' => $this->sin_detalle,
+                'manual_total' => $this->sin_detalle ? $this->manual_total : null,
+                'remito_number' => $this->remito_number !== '' ? trim($this->remito_number) : null,
+            ]);
+
+            $itemsParaGuardar = $this->sin_detalle ? [] : $this->items;
+
+            $this->purchase->items()->delete();
+            foreach ($itemsParaGuardar as $item) {
+                $this->purchase->items()->create($item);
+            }
+
+            $this->purchase->taxes()->delete();
+            foreach ($this->taxes as $tax) {
+                if (trim((string) $tax['concepto']) !== '' && (float) $tax['amount'] > 0) {
+                    $this->purchase->taxes()->create([
+                        'concepto' => trim($tax['concepto']),
+                        'amount' => $tax['amount'],
+                    ]);
+                }
+            }
+
+            StockAdjuster::apply($itemsParaGuardar, 1, $sucursalId);
+
+            $this->purchase->payments->each(fn ($payment) => CashLinker::unlinkPurchasePayment($payment));
+            $this->purchase->payments()->delete();
+
+            foreach ($this->payments as $payment) {
+                if ((float) $payment['amount'] > 0) {
+                    $created = $this->purchase->payments()->create($payment);
+                    CashLinker::linkPurchasePayment($this->purchase, $created, $sucursalId);
+                }
+            }
+        });
+
+        session()->flash('status', 'Compra actualizada.');
+        $this->redirect(route('purchases.show', $this->purchase), navigate: true);
+    }
+
+    public function render()
+    {
+        return view('livewire.purchases.edit', [
+            'selectedProviderName' => $this->provider_id !== '' ? Provider::find($this->provider_id)?->name : null,
+            'statuses' => InvoiceStatus::cases(),
+            'tiposComprobante' => TipoComprobante::cases(),
+            'paymentMethods' => PaymentMethod::cases(),
+        ]);
+    }
+}

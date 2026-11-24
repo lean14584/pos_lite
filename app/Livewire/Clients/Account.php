@@ -1,0 +1,149 @@
+<?php
+
+namespace App\Livewire\Clients;
+
+use App\Enums\PaymentMethod;
+use App\Mail\ClientAccountStatementMail;
+use App\Models\Client;
+use App\Models\ClientPayment;
+use App\Models\CompanySettings;
+use App\Support\CashLinker;
+use App\Support\CurrentSucursal;
+use App\Support\Whatsapp;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Validation\Rule;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+
+#[Layout('layouts.app')]
+class Account extends Component
+{
+    public Client $client;
+
+    public string $date;
+
+    public string $amount = '';
+
+    public string $method = 'efectivo';
+
+    public string $notes = '';
+
+    public function mount(Client $client): void
+    {
+        $this->client = $client;
+        $this->date = now()->toDateString();
+    }
+
+    public function addPayment(): void
+    {
+        // MEJORA: sin lock, un doble clic en "Registrar cobro" podía crear
+        // dos ClientPayment (y dos movimientos de caja) del mismo cobro.
+        // Mismo criterio que Cobranzas\Index::savePayment(): el lock
+        // serializa las dos llamadas, y como $amount se vacía al final de un
+        // cobro exitoso, una segunda llamada encuentra el form vacío y corta
+        // sola en la validación de abajo.
+        Cache::lock('clients:pagar:'.$this->client->id.':'.Auth::id(), 10)->block(5, fn () => $this->addPaymentInterno());
+    }
+
+    private function addPaymentInterno(): void
+    {
+        $this->validate([
+            'date' => ['required', 'date'],
+            'amount' => ['required', 'numeric', 'min:0.01'],
+            'method' => ['required', Rule::enum(PaymentMethod::class)],
+            'notes' => ['nullable', 'string'],
+        ]);
+
+        // Si no hay caja abierta, el cobro queda invisible para el arqueo
+        // (CashLinker::linkClientPayment() no avisa, solo no hace nada).
+        if (! CashLinker::hasOpenSession()) {
+            $this->addError('amount', 'Tenés que abrir la caja antes de registrar un cobro.');
+
+            return;
+        }
+
+        DB::transaction(function () {
+            $payment = ClientPayment::create([
+                'client_id' => $this->client->id,
+                'sucursal_id' => CurrentSucursal::id(),
+                'date' => $this->date,
+                'amount' => $this->amount,
+                'method' => $this->method,
+                'notes' => $this->notes ?: null,
+            ]);
+
+            CashLinker::linkClientPayment($payment);
+        });
+
+        $this->amount = '';
+        $this->notes = '';
+    }
+
+    public function enviarPorEmail(): void
+    {
+        if (! $this->client->email) {
+            session()->flash('error', 'El cliente no tiene un email cargado.');
+
+            return;
+        }
+
+        try {
+            Mail::to($this->client->email)->send(new ClientAccountStatementMail($this->client, $this->client->saldoCuentaCorriente()));
+            session()->flash('status', 'Resumen de cuenta enviado por email a '.$this->client->email.'.');
+        } catch (\Throwable $e) {
+            session()->flash('error', 'No se pudo enviar el email: '.$e->getMessage());
+        }
+    }
+
+    public function deletePayment(int $paymentId): void
+    {
+        abort_unless(Auth::user()->puedeEliminar(), 403, 'Tu rol no tiene permiso para eliminar cobros.');
+
+        $payment = ClientPayment::where('client_id', $this->client->id)->whereKey($paymentId)->first();
+
+        if ($payment) {
+            DB::transaction(function () use ($payment) {
+                CashLinker::unlinkClientPayment($payment);
+                $payment->delete();
+            });
+        }
+    }
+
+    public function render()
+    {
+        $payments = $this->client->payments()->orderBy('date')->get();
+        $this->client->setRelation('payments', $payments);
+
+        // debitLines() ya trae el signo correcto (NC/Devolución restan), el
+        // saldo de apertura (migración) si lo hay, y excluye el Remito ya
+        // facturado; acá solo se agrega el link de la fila.
+        $debits = $this->client->debitLines()->map(fn ($d) => [
+            'date' => $d['date'],
+            'label' => $d['label'],
+            'description' => $d['description'],
+            'amount' => $d['amount'],
+            'href' => $d['invoice'] ? route('invoices.show', $d['invoice']) : null,
+        ]);
+
+        // Saldo (nos debe) para el recordatorio de WhatsApp.
+        $saldo = $this->client->saldoCuentaCorriente();
+        $whatsapp = $saldo > 0.009
+            ? Whatsapp::link($this->client->phone, sprintf(
+                'Hola %s, te recordamos que tenes un saldo pendiente de $%s con %s. Muchas gracias.',
+                $this->client->name,
+                number_format($saldo, 2, ',', '.'),
+                CompanySettings::current()->display_name,
+            ))
+            : null;
+
+        return view('livewire.clients.account', [
+            'debits' => $debits,
+            'payments' => $payments,
+            'paymentMethods' => PaymentMethod::cases(),
+            'whatsappReminder' => $whatsapp,
+        ]);
+    }
+}

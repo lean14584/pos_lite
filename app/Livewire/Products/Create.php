@@ -1,0 +1,171 @@
+<?php
+
+namespace App\Livewire\Products;
+
+use App\Enums\AlicuotaIva;
+use App\Models\Category;
+use App\Models\CompanySettings;
+use App\Models\Product;
+use App\Models\ProductStock;
+use App\Support\CurrentSucursal;
+use App\Support\Ean13;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+use Livewire\WithFileUploads;
+
+#[Layout('layouts.app')]
+class Create extends Component
+{
+    use WithFileUploads;
+
+    public string $name = '';
+
+    public string $sku = '';
+
+    public bool $sold_by_weight = false;
+
+    public string $price = '';
+
+    public string $iva_rate = '21';
+
+    public string $cost_price = '';
+
+    public string $stock = '0';
+
+    public string $min_stock = '';
+
+    public string $description = '';
+
+    public string $category_id = '';
+
+    /** Foto recién seleccionada, pendiente de guardar. */
+    public $image = null;
+
+    public function mount(): void
+    {
+        $this->sku = self::nextAutoSku();
+    }
+
+    /**
+     * Siguiente código EAN13 completo (con ceros a la izquierda + dígito
+     * verificador ya calculados, ver Ean13::fromSku) para no depender de que
+     * alguien lo arme a mano — el campo queda listo para el lector desde el
+     * alta, igual que el que imprime la pantalla de Etiquetas. El número de
+     * secuencia interno sale del mayor sku ya cargado (corto o ya paddeado a
+     * 13 dígitos): si el catálogo tiene "9876"/"9877", el próximo es "9878".
+     */
+    public static function nextAutoSku(): string
+    {
+        // MEJORA: antes traía la columna sku de TODO el catálogo a PHP solo
+        // para descartar en memoria los que no son numéricos. En MySQL (el
+        // driver real de producción) se filtra con REGEXP para que solo
+        // viajen los que `ctype_digit` iba a aceptar de todos modos, sin
+        // cambiar el resultado. REGEXP no es portable a SQLite (el driver de
+        // los tests), así que ahí se sigue filtrando en PHP como antes.
+        $query = Product::query()->whereNotNull('sku')->where('sku', '!=', '');
+
+        if (config('database.default') === 'mysql') {
+            $query->whereRaw("sku REGEXP '^[0-9]{1,13}$'");
+        }
+
+        $max = $query->pluck('sku')
+            ->filter(fn (string $sku) => ctype_digit($sku))
+            ->map(fn (string $sku) => self::significantNumber($sku))
+            ->max();
+
+        $next = (string) (($max ?? 0) + 1);
+
+        return Ean13::fromSku($next) ?? $next;
+    }
+
+    /** Valor entero "de fondo" de un sku numérico, sin los ceros de relleno que le haya puesto Ean13::fromSku (o a mano). */
+    private static function significantNumber(string $sku): int
+    {
+        if (strlen($sku) === 13) {
+            return (int) (Ean13::stripPadding($sku) ?? (ltrim($sku, '0') ?: '0'));
+        }
+
+        return (int) $sku;
+    }
+
+    public function save(): void
+    {
+        // Empresa Monotributista/Exenta: el selector ni se muestra (ver
+        // debeOcultarIvaPorItem()), así que se fuerza acá también por si
+        // quedó un valor viejo en la propiedad — nunca se guarda con IVA.
+        if (CompanySettings::current()->debeOcultarIvaPorItem()) {
+            $this->iva_rate = '0';
+        }
+
+        $data = $this->validate([
+            'name' => ['required', 'string', 'max:255'],
+            'sku' => ['nullable', 'string', 'max:255', Rule::requiredIf($this->sold_by_weight), 'unique:products,sku'],
+            'sold_by_weight' => ['boolean'],
+            'price' => ['required', 'numeric', 'min:0'],
+            'iva_rate' => ['required', Rule::in(AlicuotaIva::valores())],
+            'cost_price' => ['nullable', 'numeric', 'min:0'],
+            'stock' => ['required', 'integer', 'min:0'],
+            'min_stock' => ['nullable', 'integer', 'min:0'],
+            'description' => ['nullable', 'string'],
+            'category_id' => ['nullable', 'exists:categories,id'],
+            // 'image' de Laravel admite SVG, que puede llevar <script>
+            // embebido (XSS almacenado si algún día se sirve el archivo
+            // fuera de un <img>). Se restringe a los formatos rasterizados.
+            'image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp', 'max:4096'],
+        ]);
+
+        if ($this->sold_by_weight && $data['sku'] !== null && ! ctype_digit($data['sku'])) {
+            $this->addError('sku', 'El código de un producto por peso tiene que ser numérico (es el PLU que reconoce la balanza).');
+
+            return;
+        }
+
+        $data['cost_price'] = $data['cost_price'] !== '' ? $data['cost_price'] : null;
+        $data['min_stock'] = $data['min_stock'] !== '' ? $data['min_stock'] : null;
+        $data['category_id'] = $data['category_id'] !== '' ? $data['category_id'] : null;
+        $data['sku'] = $data['sku'] !== '' ? $data['sku'] : null;
+        $data['description'] = $data['description'] !== '' ? $data['description'] : null;
+
+        // Los productos por peso no llevan control de stock (se reponen a
+        // granel, no por unidad) — se ignora lo que se haya tipeado en Stock.
+        if ($data['sold_by_weight']) {
+            $data['stock'] = 0;
+        }
+
+        if ($this->image) {
+            $data['image_path'] = $this->image->store('products', 'public');
+        }
+        unset($data['image']);
+
+        // Dos escrituras relacionadas (el producto + su fila de stock por
+        // sucursal): sin transacción, una falla entre medio deja el producto
+        // creado con products.stock > 0 pero sin fila en product_stocks.
+        $sucursalId = CurrentSucursal::id();
+        $product = DB::transaction(function () use ($data, $sucursalId) {
+            $product = Product::create($data);
+
+            // El stock inicial cargado acá es el de la sucursal activa: crear la
+            // fila de product_stocks correspondiente (products.stock ya quedó
+            // bien como agregado, por venir en $data desde la creación).
+            if (! $data['sold_by_weight'] && $sucursalId !== null && (int) $data['stock'] > 0) {
+                ProductStock::create(['product_id' => $product->id, 'sucursal_id' => $sucursalId, 'stock' => $data['stock']]);
+            }
+
+            return $product;
+        });
+
+        session()->flash('status', 'Producto creado.');
+        $this->redirect(route('products.index'), navigate: true);
+    }
+
+    public function render()
+    {
+        return view('livewire.products.create', [
+            'categories' => Category::forSelectCached(),
+            'sucursalActiva' => CurrentSucursal::get(),
+            'ocultarIva' => CompanySettings::current()->debeOcultarIvaPorItem(),
+        ]);
+    }
+}

@@ -1,0 +1,274 @@
+<?php
+
+namespace App\Livewire\Tiendanube;
+
+use App\Models\CompanySettings;
+use App\Models\Sucursal;
+use App\Services\Tiendanube\TiendanubeClient;
+use App\Services\Tiendanube\TiendanubeSync;
+use Illuminate\Support\Facades\Log;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+
+#[Layout('layouts.app')]
+class Index extends Component
+{
+    public CompanySettings $company;
+
+    public string $tiendanube_store_id = '';
+
+    public string $tiendanube_token = '';
+
+    public string $tiendanube_webhook_secret = '';
+
+    public string $tiendanube_sucursal_id = '';
+
+    /** Resultado de la última acción, para mostrar en pantalla. */
+    public ?string $resultado = null;
+
+    public ?string $error = null;
+
+    /** Eventos que se registran para la sincronización automática. */
+    private const WEBHOOK_EVENTS = [
+        'order/created', 'order/paid',
+        'product/updated', 'product/created',
+        'customer/created', 'customer/updated',
+        'category/created', 'category/updated',
+    ];
+
+    public function mount(): void
+    {
+        $this->company = CompanySettings::current();
+        $this->tiendanube_store_id = (string) $this->company->tiendanube_store_id;
+        $this->tiendanube_sucursal_id = $this->company->tiendanube_sucursal_id ? (string) $this->company->tiendanube_sucursal_id : '';
+        // Token y secreto NO se precargan acá: Livewire serializa el estado
+        // del componente en el HTML de la página, así que un input type=
+        // password con el valor real igual lo manda en texto plano al
+        // navegador (visible con "ver código fuente"). Se dejan vacíos y se
+        // muestran solo como "cargado/no cargado" (ver tokenCargado()); si
+        // el campo queda vacío al guardar, saveCredentials() no lo pisa.
+    }
+
+    public function tokenCargado(): bool
+    {
+        return filled($this->company->tiendanube_token);
+    }
+
+    public function secretoCargado(): bool
+    {
+        return filled($this->company->tiendanube_webhook_secret);
+    }
+
+    public function saveCredentials(): void
+    {
+        $data = $this->validate([
+            'tiendanube_store_id' => ['nullable', 'string', 'max:50'],
+            'tiendanube_token' => ['nullable', 'string', 'max:255'],
+            'tiendanube_webhook_secret' => ['nullable', 'string', 'max:255'],
+            'tiendanube_sucursal_id' => ['nullable', 'exists:sucursales,id'],
+        ]);
+
+        $data['tiendanube_sucursal_id'] = $data['tiendanube_sucursal_id'] ?: null;
+
+        // Campo vacío = "no cambiar" (no hay forma de distinguir "vacío a
+        // propósito" de "no tocado" ya que nunca se precarga el valor real).
+        if (blank($data['tiendanube_token'])) {
+            unset($data['tiendanube_token']);
+        }
+        if (blank($data['tiendanube_webhook_secret'])) {
+            unset($data['tiendanube_webhook_secret']);
+        }
+
+        $this->company->update($data);
+        $this->company->refresh();
+        $this->tiendanube_token = '';
+        $this->tiendanube_webhook_secret = '';
+        $this->reset('resultado', 'error');
+
+        session()->flash('status', 'Credenciales de Tiendanube guardadas.');
+    }
+
+    public function testConnection(): void
+    {
+        $this->reset('resultado', 'error');
+
+        try {
+            $store = app(TiendanubeClient::class)->getStore();
+            $nombre = $this->texto($store['name'] ?? 'tu tienda');
+            $this->resultado = '✓ Conectado a «'.$nombre.'».';
+        } catch (\Throwable $e) {
+            // No mostrar el mensaje crudo de la excepción, aunque solo lo vea
+            // un admin — puede traer detalles de infraestructura (URLs
+            // internas, trazas) que no hace falta exponer en la UI.
+            Log::error('Tiendanube testConnection falló', ['exception' => $e]);
+            $this->error = 'No se pudo conectar con Tiendanube. Revisá el token de acceso en la configuración.';
+        }
+    }
+
+    public function importProducts(): void
+    {
+        $this->correr(function (TiendanubeSync $sync) {
+            $r = $sync->importProducts();
+
+            return "Productos: {$r['creados']} creados, {$r['actualizados']} actualizados.";
+        });
+    }
+
+    public function importOrders(): void
+    {
+        $this->correr(function (TiendanubeSync $sync) {
+            $r = $sync->importOrders();
+
+            return "Pedidos: {$r['importados']} importados, {$r['omitidos']} ya existían".($r['errores'] ? ", {$r['errores']} con error." : '.');
+        });
+    }
+
+    public function syncStock(): void
+    {
+        $this->correr(function (TiendanubeSync $sync) {
+            $r = $sync->pushStock();
+
+            return "Stock enviado a Tiendanube: {$r['enviados']} productos".($r['errores'] ? ", {$r['errores']} con error." : '.');
+        });
+    }
+
+    public function pushProducts(): void
+    {
+        $this->correr(function (TiendanubeSync $sync) {
+            $r = $sync->pushProducts();
+
+            return "Productos enviados a Tiendanube: {$r['creados']} creados, {$r['actualizados']} actualizados".($r['errores'] ? ", {$r['errores']} con error." : '.');
+        });
+    }
+
+    public function pullStock(): void
+    {
+        $this->correr(function (TiendanubeSync $sync) {
+            $r = $sync->pullStock();
+
+            return "Stock traído de Tiendanube: {$r['actualizados']} productos actualizados.";
+        });
+    }
+
+    public function importClients(): void
+    {
+        $this->correr(function (TiendanubeSync $sync) {
+            $r = $sync->pullCustomers();
+
+            return "Clientes: {$r['creados']} traídos, {$r['actualizados']} actualizados.";
+        });
+    }
+
+    public function pushClients(): void
+    {
+        $this->correr(function (TiendanubeSync $sync) {
+            $r = $sync->pushCustomers();
+
+            return "Clientes enviados a Tiendanube: {$r['creados']} creados, {$r['actualizados']} actualizados".($r['errores'] ? ", {$r['errores']} con error." : '.');
+        });
+    }
+
+    public function importCategories(): void
+    {
+        $this->correr(function (TiendanubeSync $sync) {
+            $r = $sync->pullCategories();
+
+            return "Categorías: {$r['creados']} traídas, {$r['actualizados']} actualizadas.";
+        });
+    }
+
+    public function pushCategories(): void
+    {
+        $this->correr(function (TiendanubeSync $sync) {
+            $r = $sync->pushCategories();
+
+            return "Categorías enviadas a Tiendanube: {$r['enviados']} enviadas".($r['errores'] ? ", {$r['errores']} con error." : '.');
+        });
+    }
+
+    public function enableWebhooks(): void
+    {
+        if (empty($this->company->tiendanube_webhook_secret)) {
+            $this->reset('resultado', 'error');
+            $this->error = 'Cargá y guardá un secreto de webhook antes de activar la sincronización automática: sin él, el endpoint público no puede validar que las notificaciones vengan de Tiendanube.';
+
+            return;
+        }
+
+        $this->correr(function (TiendanubeSync $sync) {
+            $client = app(TiendanubeClient::class);
+
+            // Limpia los que hubiera para no duplicar, y registra el set.
+            foreach ($client->listWebhooks() as $w) {
+                if (isset($w['id'])) {
+                    $client->deleteWebhook((int) $w['id']);
+                }
+            }
+
+            $url = route('tiendanube.webhook');
+            $registrados = 0;
+            foreach (self::WEBHOOK_EVENTS as $event) {
+                try {
+                    $client->createWebhook($event, $url);
+                    $registrados++;
+                } catch (\Throwable $e) {
+                    // Un evento que la tienda no soporte no debe frenar al resto.
+                    report($e);
+                }
+            }
+
+            return "Sincronización automática activada ({$registrados} eventos).";
+        });
+    }
+
+    public function disableWebhooks(): void
+    {
+        $this->correr(function (TiendanubeSync $sync) {
+            $client = app(TiendanubeClient::class);
+            $borrados = 0;
+
+            foreach ($client->listWebhooks() as $w) {
+                if (isset($w['id'])) {
+                    $client->deleteWebhook((int) $w['id']);
+                    $borrados++;
+                }
+            }
+
+            return "Sincronización automática desactivada ({$borrados} eventos quitados).";
+        });
+    }
+
+    private function correr(callable $accion): void
+    {
+        $this->reset('resultado', 'error');
+
+        if (! app(TiendanubeClient::class)->isConfigured()) {
+            $this->error = 'Primero cargá y guardá el Store ID y el Access Token.';
+
+            return;
+        }
+
+        try {
+            $this->resultado = $accion(app(TiendanubeSync::class));
+        } catch (\Throwable $e) {
+            $this->error = 'Error: '.$e->getMessage();
+        }
+    }
+
+    private function texto(mixed $valor): string
+    {
+        if (is_array($valor)) {
+            return (string) (reset($valor) ?: '');
+        }
+
+        return (string) $valor;
+    }
+
+    public function render()
+    {
+        return view('livewire.tiendanube.index', [
+            'configurado' => app(TiendanubeClient::class)->isConfigured(),
+            'sucursales' => Sucursal::where('active', true)->orderBy('name')->get(),
+        ]);
+    }
+}

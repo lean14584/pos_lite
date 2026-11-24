@@ -1,0 +1,193 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Enums\Role;
+use App\Models\Client;
+use App\Models\Invoice;
+use App\Models\Product;
+use App\Models\Provider;
+use App\Models\Purchase;
+use App\Models\Sucursal;
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Livewire\Livewire;
+use Tests\TestCase;
+
+class VencimientosTest extends TestCase
+{
+    use RefreshDatabase;
+
+    private function admin(): User
+    {
+        return User::factory()->create(['role' => Role::Admin, 'active' => true]);
+    }
+
+    public function test_muestra_por_cobrar_y_por_pagar_con_saldo(): void
+    {
+        // Cliente con factura impaga vencida.
+        $client = Client::create(['name' => 'Kiosco Sur', 'email' => 'k@test.com']);
+        $inv = Invoice::create(['number' => 'FAC-1', 'client_id' => $client->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(20), 'due_date' => now()->subDays(5), 'status' => 'pending']);
+        $inv->items()->create(['description' => 'x', 'quantity' => 1, 'unit_price' => 8000]);
+
+        // Proveedor con compra impaga.
+        $product = Product::create(['name' => 'Insumo', 'price' => 20000, 'iva_rate' => 21, 'stock' => 0]);
+        $provider = Provider::create(['name' => 'Proveedor A']);
+        $pur = Purchase::create(['number' => 'COM-1', 'provider_id' => $provider->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(10), 'due_date' => now()->subDays(2), 'status' => 'pending']);
+        $pur->items()->create(['product_id' => $product->id, 'description' => 'x', 'quantity' => 1, 'unit_price' => 20000]);
+
+        Livewire::actingAs($this->admin())->test('vencimientos.index')
+            ->assertSee('Kiosco Sur')
+            ->assertSee('8.000,00')
+            ->assertSee('Proveedor A')
+            ->assertSee('20.000,00')
+            ->assertSee('Vencido');
+    }
+
+    public function test_los_pagos_a_cuenta_reducen_el_saldo(): void
+    {
+        $client = Client::create(['name' => 'Cliente Pago', 'email' => 'p@test.com']);
+        $inv = Invoice::create(['number' => 'FAC-2', 'client_id' => $client->id, 'tax_rate' => 0, 'issue_date' => now(), 'due_date' => now()->addDays(5), 'status' => 'pending']);
+        $inv->items()->create(['description' => 'x', 'quantity' => 1, 'unit_price' => 5000]);
+        // Ya pagó todo a cuenta corriente.
+        $client->payments()->create(['date' => now(), 'amount' => 5000, 'method' => 'efectivo']);
+
+        Livewire::actingAs($this->admin())->test('vencimientos.index')
+            ->assertDontSee('Cliente Pago');
+    }
+
+    /**
+     * Antes de este fix, "por cobrar" no filtraba por sucursal en absoluto:
+     * un admin veía mezclada la deuda de todos los locales sin poder
+     * separarla.
+     */
+    public function test_admin_puede_filtrar_por_cobrar_por_sucursal(): void
+    {
+        $principal = Sucursal::sole();
+        $norte = Sucursal::create(['name' => 'Norte', 'razon_social' => 'Mi Empresa', 'punto_venta' => 2]);
+
+        $clientePrincipal = Client::create(['name' => 'Cliente Principal', 'email' => 'cp@test.com']);
+        $invP = Invoice::create(['number' => 'FAC-P', 'client_id' => $clientePrincipal->id, 'sucursal_id' => $principal->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(5), 'due_date' => now()->subDays(1), 'status' => 'pending']);
+        $invP->items()->create(['description' => 'x', 'quantity' => 1, 'unit_price' => 1000]);
+
+        $clienteNorte = Client::create(['name' => 'Cliente Norte', 'email' => 'cn@test.com']);
+        $invN = Invoice::create(['number' => 'FAC-N', 'client_id' => $clienteNorte->id, 'sucursal_id' => $norte->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(5), 'due_date' => now()->subDays(1), 'status' => 'pending']);
+        $invN->items()->create(['description' => 'x', 'quantity' => 1, 'unit_price' => 2000]);
+
+        Livewire::actingAs($this->admin())->test('vencimientos.index')
+            ->assertSee('Cliente Principal')
+            ->assertSee('Cliente Norte');
+
+        Livewire::actingAs($this->admin())->test('vencimientos.index')
+            ->set('sucursal_id', (string) $norte->id)
+            ->assertDontSee('Cliente Principal')
+            ->assertSee('Cliente Norte');
+    }
+
+    /**
+     * MEJORA: ClientPayment no tiene sucursal_id (el crédito a cuenta
+     * corriente es de toda la empresa). Antes, cada vista filtrada por
+     * sucursal le imputaba al cliente el crédito COMPLETO de nuevo — un
+     * cliente que compra en dos sucursales terminaba con el crédito
+     * "duplicado" (aplicado íntegro en cada filtro), mostrando menos deuda
+     * de la real en cada sucursal vista por separado.
+     */
+    public function test_el_credito_del_cliente_no_se_duplica_al_filtrar_por_sucursal(): void
+    {
+        $principal = Sucursal::sole();
+        $norte = Sucursal::create(['name' => 'Norte', 'razon_social' => 'Mi Empresa', 'punto_venta' => 2]);
+
+        $client = Client::create(['name' => 'Cliente Multi', 'email' => 'cm@test.com']);
+
+        $invP = Invoice::create(['number' => 'FAC-P', 'client_id' => $client->id, 'sucursal_id' => $principal->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(10), 'due_date' => now()->subDays(5), 'status' => 'pending']);
+        $invP->items()->create(['description' => 'x', 'quantity' => 1, 'unit_price' => 1000]);
+
+        $invN = Invoice::create(['number' => 'FAC-N', 'client_id' => $client->id, 'sucursal_id' => $norte->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(5), 'due_date' => now()->subDays(1), 'status' => 'pending']);
+        $invN->items()->create(['description' => 'x', 'quantity' => 1, 'unit_price' => 1000]);
+
+        // Crédito a cuenta que alcanza para cancelar SOLO la más vieja (FAC-P).
+        $client->payments()->create(['date' => now(), 'amount' => 1000, 'method' => 'efectivo']);
+
+        // Filtrado por Principal: FAC-P ya está saldada por el crédito, no debería aparecer.
+        Livewire::actingAs($this->admin())->test('vencimientos.index')
+            ->set('sucursal_id', (string) $principal->id)
+            ->assertDontSee('Cliente Multi');
+
+        // Filtrado por Norte: el crédito ya se usó en FAC-P (la más vieja),
+        // así que FAC-N sigue debiendo sus $1.000 completos — si el crédito
+        // se duplicara, esta vista también la mostraría saldada.
+        Livewire::actingAs($this->admin())->test('vencimientos.index')
+            ->set('sucursal_id', (string) $norte->id)
+            ->assertSee('Cliente Multi')
+            ->assertSee('1.000,00');
+    }
+
+    public function test_vendedor_solo_ve_por_cobrar_de_su_propia_sucursal(): void
+    {
+        $principal = Sucursal::sole();
+        $norte = Sucursal::create(['name' => 'Norte', 'razon_social' => 'Mi Empresa', 'punto_venta' => 2]);
+        $vendedor = User::factory()->create(['role' => Role::Vendedor, 'active' => true, 'sucursal_id' => $principal->id]);
+
+        $clientePrincipal = Client::create(['name' => 'Cliente Principal', 'email' => 'cp@test.com']);
+        $invP = Invoice::create(['number' => 'FAC-P', 'client_id' => $clientePrincipal->id, 'sucursal_id' => $principal->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(5), 'due_date' => now()->subDays(1), 'status' => 'pending']);
+        $invP->items()->create(['description' => 'x', 'quantity' => 1, 'unit_price' => 1000]);
+
+        $clienteNorte = Client::create(['name' => 'Cliente Norte', 'email' => 'cn@test.com']);
+        $invN = Invoice::create(['number' => 'FAC-N', 'client_id' => $clienteNorte->id, 'sucursal_id' => $norte->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(5), 'due_date' => now()->subDays(1), 'status' => 'pending']);
+        $invN->items()->create(['description' => 'x', 'quantity' => 1, 'unit_price' => 2000]);
+
+        Livewire::actingAs($vendedor)->test('vencimientos.index')
+            ->assertSee('Cliente Principal')
+            ->assertDontSee('Cliente Norte');
+    }
+
+    /**
+     * Bug real: a diferencia de "por cobrar", "por pagar" no filtraba por
+     * sucursal en absoluto pese a que Purchase sí tiene sucursal_id desde
+     * add_sucursal_id_to_purchases_table — un Vendedor/Encargado veía la
+     * deuda con proveedores de TODAS las sucursales, no solo la suya.
+     */
+    public function test_admin_puede_filtrar_por_pagar_por_sucursal(): void
+    {
+        $principal = Sucursal::sole();
+        $norte = Sucursal::create(['name' => 'Norte', 'razon_social' => 'Mi Empresa', 'punto_venta' => 2]);
+        $product = Product::create(['name' => 'Insumo', 'price' => 1000, 'stock' => 0]);
+
+        $proveedorPrincipal = Provider::create(['name' => 'Proveedor Principal']);
+        $comP = Purchase::create(['number' => 'COM-P', 'provider_id' => $proveedorPrincipal->id, 'sucursal_id' => $principal->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(5), 'due_date' => now()->subDays(1), 'status' => 'pending']);
+        $comP->items()->create(['product_id' => $product->id, 'description' => 'x', 'quantity' => 1, 'unit_price' => 1000]);
+
+        $proveedorNorte = Provider::create(['name' => 'Proveedor Norte']);
+        $comN = Purchase::create(['number' => 'COM-N', 'provider_id' => $proveedorNorte->id, 'sucursal_id' => $norte->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(5), 'due_date' => now()->subDays(1), 'status' => 'pending']);
+        $comN->items()->create(['product_id' => $product->id, 'description' => 'x', 'quantity' => 1, 'unit_price' => 2000]);
+
+        Livewire::actingAs($this->admin())->test('vencimientos.index')
+            ->assertSee('Proveedor Principal')
+            ->assertSee('Proveedor Norte');
+
+        Livewire::actingAs($this->admin())->test('vencimientos.index')
+            ->set('sucursal_id', (string) $norte->id)
+            ->assertDontSee('Proveedor Principal')
+            ->assertSee('Proveedor Norte');
+    }
+
+    public function test_vendedor_solo_ve_por_pagar_de_su_propia_sucursal(): void
+    {
+        $principal = Sucursal::sole();
+        $norte = Sucursal::create(['name' => 'Norte', 'razon_social' => 'Mi Empresa', 'punto_venta' => 2]);
+        $vendedor = User::factory()->create(['role' => Role::Vendedor, 'active' => true, 'sucursal_id' => $principal->id]);
+        $product = Product::create(['name' => 'Insumo', 'price' => 1000, 'stock' => 0]);
+
+        $proveedorPrincipal = Provider::create(['name' => 'Proveedor Principal']);
+        $comP = Purchase::create(['number' => 'COM-P', 'provider_id' => $proveedorPrincipal->id, 'sucursal_id' => $principal->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(5), 'due_date' => now()->subDays(1), 'status' => 'pending']);
+        $comP->items()->create(['product_id' => $product->id, 'description' => 'x', 'quantity' => 1, 'unit_price' => 1000]);
+
+        $proveedorNorte = Provider::create(['name' => 'Proveedor Norte']);
+        $comN = Purchase::create(['number' => 'COM-N', 'provider_id' => $proveedorNorte->id, 'sucursal_id' => $norte->id, 'tax_rate' => 0, 'issue_date' => now()->subDays(5), 'due_date' => now()->subDays(1), 'status' => 'pending']);
+        $comN->items()->create(['product_id' => $product->id, 'description' => 'x', 'quantity' => 1, 'unit_price' => 2000]);
+
+        Livewire::actingAs($vendedor)->test('vencimientos.index')
+            ->assertSee('Proveedor Principal')
+            ->assertDontSee('Proveedor Norte');
+    }
+}

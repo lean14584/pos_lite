@@ -1,0 +1,132 @@
+<?php
+
+namespace App\Livewire\Providers;
+
+use App\Enums\PaymentMethod;
+use App\Mail\ProviderAccountStatementMail;
+use App\Models\Provider;
+use App\Models\ProviderPayment;
+use App\Support\CashLinker;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Validation\Rule;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+
+#[Layout('layouts.app')]
+class Account extends Component
+{
+    public Provider $provider;
+
+    public string $date;
+
+    public string $amount = '';
+
+    public string $method = 'efectivo';
+
+    public string $notes = '';
+
+    public function mount(Provider $provider): void
+    {
+        $this->provider = $provider;
+        $this->date = now()->toDateString();
+    }
+
+    public function addPayment(): void
+    {
+        // MEJORA: sin lock, un doble clic en "Registrar pago" podía crear
+        // dos ProviderPayment (y dos movimientos de caja) del mismo pago.
+        // Mismo criterio que Clients\Account::addPayment().
+        Cache::lock('providers:pagar:'.$this->provider->id.':'.Auth::id(), 10)->block(5, fn () => $this->addPaymentInterno());
+    }
+
+    private function addPaymentInterno(): void
+    {
+        $this->validate([
+            'date' => ['required', 'date'],
+            'amount' => ['required', 'numeric', 'min:0.01'],
+            'method' => ['required', Rule::enum(PaymentMethod::class)],
+            'notes' => ['nullable', 'string'],
+        ]);
+
+        // Si no hay caja abierta, el pago que sale queda invisible para el
+        // arqueo (CashLinker::linkProviderPayment() no avisa, solo no hace nada).
+        if (! CashLinker::hasOpenSession()) {
+            $this->addError('amount', 'Tenés que abrir la caja antes de registrar un pago.');
+
+            return;
+        }
+
+        DB::transaction(function () {
+            $payment = ProviderPayment::create([
+                'provider_id' => $this->provider->id,
+                'date' => $this->date,
+                'amount' => $this->amount,
+                'method' => $this->method,
+                'notes' => $this->notes ?: null,
+            ]);
+
+            CashLinker::linkProviderPayment($payment);
+        });
+
+        $this->amount = '';
+        $this->notes = '';
+    }
+
+    public function enviarPorEmail(): void
+    {
+        if (! $this->provider->email) {
+            session()->flash('error', 'El proveedor no tiene un email cargado.');
+
+            return;
+        }
+
+        try {
+            Mail::to($this->provider->email)->send(new ProviderAccountStatementMail($this->provider, $this->provider->saldoCuentaCorriente()));
+            session()->flash('status', 'Resumen de cuenta enviado por email a '.$this->provider->email.'.');
+        } catch (\Throwable $e) {
+            session()->flash('error', 'No se pudo enviar el email: '.$e->getMessage());
+        }
+    }
+
+    public function deletePayment(int $paymentId): void
+    {
+        abort_unless(Auth::user()->puedeEliminar(), 403, 'Tu rol no tiene permiso para eliminar pagos.');
+
+        $payment = ProviderPayment::where('provider_id', $this->provider->id)->whereKey($paymentId)->first();
+
+        if ($payment) {
+            DB::transaction(function () use ($payment) {
+                CashLinker::unlinkProviderPayment($payment);
+                $payment->delete();
+            });
+        }
+    }
+
+    public function render()
+    {
+        $payments = $this->provider->payments()->orderBy('date')->get();
+
+        // Se deja cargado para que saldoCuentaCorriente() reutilice estos
+        // mismos datos (loadMissing) en vez de volver a consultarlos.
+        $this->provider->setRelation('payments', $payments);
+
+        // debitLines() ya trae el saldo de apertura (migración) como una
+        // línea más si el proveedor tiene uno cargado.
+        $debits = $this->provider->debitLines()->map(fn ($d) => [
+            'date' => $d['date'],
+            'label' => $d['label'],
+            'description' => $d['description'],
+            'amount' => $d['amount'],
+            'href' => $d['purchase'] ? route('purchases.show', $d['purchase']) : null,
+        ]);
+
+        return view('livewire.providers.account', [
+            'debits' => $debits,
+            'payments' => $payments,
+            'paymentMethods' => PaymentMethod::cases(),
+        ]);
+    }
+}

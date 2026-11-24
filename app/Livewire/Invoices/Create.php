@@ -1,0 +1,358 @@
+<?php
+
+namespace App\Livewire\Invoices;
+
+use App\Enums\AlicuotaIva;
+use App\Enums\InvoiceStatus;
+use App\Enums\PaymentMethod;
+use App\Enums\TipoComprobanteInterno;
+use App\Livewire\Invoices\Concerns\ManagesInvoiceLines;
+use App\Models\Client;
+use App\Models\CompanySettings;
+use App\Models\Invoice;
+use App\Models\PriceList;
+use App\Models\Product;
+use App\Models\PuntoVenta;
+use App\Support\CashLinker;
+use App\Support\CurrentSucursal;
+use App\Support\InvoiceNumberGenerator;
+use App\Support\StockAdjuster;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\URL;
+use Illuminate\Validation\Rule;
+use Livewire\Attributes\Computed;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+
+#[Layout('layouts.app')]
+class Create extends Component
+{
+    use ManagesInvoiceLines;
+
+    public string $client_id = '';
+
+    public ?int $price_list_id = null;
+
+    public string $tipo_comprobante_interno = 'factura_b';
+
+    /** Vacío = usar el único/por defecto de la sucursal activa (no se muestra selector). */
+    public string $punto_venta = '';
+
+    public string $issue_date;
+
+    public string $due_date;
+
+    public string $tax_rate = '0';
+
+    public string $notes = '';
+
+    public string $status = 'draft';
+
+    public bool $printOnSave = true;
+
+    /**
+     * Guarda contra doble-submit: esta pantalla, a diferencia de Pos\Index
+     * (donde el carrito se vacía solo al vender), no tiene ningún estado
+     * persistente natural para releer y detectar "esto ya se guardó" — el
+     * form sigue lleno después de un submit exitoso, así que se necesita
+     * este flag explícito. Se serializa igual en el snapshot de Livewire
+     * entre requests, a diferencia de una propiedad privada.
+     */
+    public bool $submitted = false;
+
+    /** @var array<int, array{product_id: ?int, description: string, quantity: string, unit_price: string, discount: string}> */
+    public array $items = [];
+
+    /** @var array<int, array{method: string, amount: string}> */
+    public array $payments = [];
+
+    public string $productQuery = '';
+
+    public string $clientQuery = '';
+
+    public function mount(): void
+    {
+        $this->issue_date = now()->toDateString();
+        $this->due_date = now()->addDays(15)->toDateString();
+        $cf = Client::consumidorFinal();
+        $this->client_id = (string) $cf->id;
+        $this->price_list_id = $cf->price_list_id; // null = precio base
+        // Arranca en un tipo que la empresa tenga habilitado (evita quedar
+        // en Factura B cuando B está apagada, por ejemplo).
+        $this->tipo_comprobante_interno = CompanySettings::current()->tipoComprobantePorDefecto()->value;
+
+        $default = CurrentSucursal::get()?->puntoVentaPorDefecto();
+        $this->punto_venta = $default ? (string) $default->numero : '';
+    }
+
+    /** Puntos de venta activos de la sucursal donde se está facturando. */
+    #[Computed]
+    public function puntosVentaOpciones()
+    {
+        $sucursalId = CurrentSucursal::id();
+
+        return $sucursalId
+            ? PuntoVenta::activosParaSucursalCached($sucursalId)
+            : collect();
+    }
+
+    /** Lista de precios vigente. null = precio base (sin ajuste). */
+    public function currentPriceList(): ?PriceList
+    {
+        // FEATURE_PRICE_LISTS=false apagaba solo la pantalla de
+        // administración de listas (routes/web.php) — el selector de acá
+        // seguía aplicando la lista del cliente/elegida igual, así que el
+        // flag no desactivaba nada de lo que su nombre promete.
+        if (! config('features.price_lists')) {
+            return null;
+        }
+
+        return $this->price_list_id ? PriceList::find($this->price_list_id) : null;
+    }
+
+    /** Al cambiar de cliente, tomo su lista asignada (o precio base) y recalculo. */
+    public function updatedClientId($value): void
+    {
+        $client = Client::find($value);
+        $this->price_list_id = $client?->price_list_id;
+        $this->repriceItems();
+    }
+
+    public function updatedPriceListId(): void
+    {
+        $this->repriceItems();
+    }
+
+    #[Computed]
+    public function clientResults()
+    {
+        $term = trim($this->clientQuery);
+
+        // Con 1 solo caracter el LIKE '%x%' escanea toda la tabla en cada
+        // tecla sin acotar casi nada el resultado — se pide un mínimo.
+        if (mb_strlen($term) < 2) {
+            return collect();
+        }
+
+        return Client::where('name', 'like', "%{$term}%")
+            ->orWhere('phone', 'like', "%{$term}%")
+            ->limit(8)
+            ->get();
+    }
+
+    public function selectClient(int $clientId): void
+    {
+        $this->clientQuery = '';
+        $this->client_id = (string) $clientId;
+        $this->updatedClientId($clientId);
+    }
+
+    /** Reaplica el precio de la lista a los ítems que provienen de un producto. */
+    private function repriceItems(): void
+    {
+        $list = $this->currentPriceList();
+        $productIds = collect($this->items)->pluck('product_id')->filter()->unique()->all();
+        $products = Product::whereIn('id', $productIds)->get()->keyBy('id');
+
+        foreach ($this->items as $i => $item) {
+            if (! empty($item['product_id']) && ($product = $products->get($item['product_id']))) {
+                $this->items[$i]['unit_price'] = (string) $product->priceForList($list);
+            }
+        }
+    }
+
+    #[Computed]
+    public function productResults()
+    {
+        $term = trim($this->productQuery);
+
+        // Con 1 solo caracter el LIKE '%x%' escanea toda la tabla en cada
+        // tecla sin acotar casi nada el resultado — se pide un mínimo.
+        if (mb_strlen($term) < 2) {
+            return collect();
+        }
+
+        return Product::where('name', 'like', "%{$term}%")
+            ->orWhere('sku', 'like', "%{$term}%")
+            ->limit(8)
+            ->get();
+    }
+
+    public function save(): void
+    {
+        // MEJORA: a diferencia de Pos\Index (el carrito se vacía solo al
+        // vender) o de NotasCredito/FacturarRemito/Quotes (releen un
+        // registro existente con fresh()), este formulario de alta no tiene
+        // ningún estado persistente para detectar "esto ya se guardó" — dos
+        // submits casi simultáneos (doble clic) pasaban las mismas
+        // validaciones y creaban dos facturas. El lock serializa las dos
+        // llamadas (mismo criterio que CashRegister::openSession()) y el
+        // flag $submitted, chequeado/seteado adentro, corta la segunda.
+        Cache::lock('invoices:create:'.CurrentSucursal::id().':'.Auth::id(), 10)->block(5, fn () => $this->saveInterno());
+    }
+
+    private function saveInterno(): void
+    {
+        if ($this->submitted) {
+            return;
+        }
+
+        $this->validate([
+            'client_id' => ['required', 'exists:clients,id'],
+            'tipo_comprobante_interno' => ['required', Rule::enum(TipoComprobanteInterno::class)],
+            'issue_date' => ['required', 'date'],
+            'due_date' => ['required', 'date'],
+            'status' => ['required'],
+            'notes' => ['nullable', 'string'],
+            // Mismo tope que Purchases/Create — antes no había ninguna regla
+            // acá (ni de este lado ni en la columna decimal de la DB), así
+            // que un ítem con cantidad o precio negativo/cero podía llegar a
+            // guardarse y mover stock en sentido incorrecto.
+            'items.*.quantity' => ['required', 'numeric', 'min:0.01'],
+            'items.*.unit_price' => ['required', 'numeric', 'min:0'],
+            'items.*.iva_rate' => ['nullable', Rule::in(AlicuotaIva::valores())],
+            'items.*.discount' => ['nullable', 'numeric', 'between:0,100'],
+        ]);
+
+        $validItems = collect($this->items)->filter(fn ($item) => trim($item['description']) !== '');
+
+        if ($validItems->isEmpty()) {
+            $this->addError('items', 'Agregá al menos un ítem con descripción.');
+
+            return;
+        }
+
+        $tipo = TipoComprobanteInterno::from($this->tipo_comprobante_interno);
+
+        if (! in_array($tipo, CompanySettings::current()->tiposComprobanteSeleccionables(), true)) {
+            $this->addError('tipo_comprobante_interno', 'Ese tipo de comprobante está deshabilitado en la configuración.');
+
+            return;
+        }
+
+        // El punto de venta elegido tiene que ser uno de los realmente
+        // habilitados para la sucursal activa — nunca confiar en lo que
+        // venga del componente sin volver a chequearlo contra la base.
+        $puntoVentaNumero = $this->puntosVentaOpciones()->firstWhere('numero', (int) $this->punto_venta)?->numero;
+
+        if ($puntoVentaNumero === null) {
+            $this->addError('punto_venta', 'Elegí un punto de venta válido.');
+
+            return;
+        }
+
+        // Límite de crédito: solo comprobantes que generan deuda (no NC ni devolución).
+        if (! $tipo->esNotaCredito() && $tipo !== TipoComprobanteInterno::Devolucion) {
+            $pendiente = round($this->total() - $this->paidTotal(), 2);
+            $cliente = Client::find($this->client_id);
+            if ($pendiente > 0.009 && $cliente && ($excesoMsg = $cliente->excesoDeCredito($pendiente))) {
+                $this->addError('client_id', $excesoMsg);
+
+                return;
+            }
+        }
+
+        // Si se va a registrar un cobro/reintegro, tiene que quedar anotado
+        // en una caja abierta — si no, la plata queda invisible para el
+        // arqueo (CashLinker::linkX() no avisa, solo no hace nada).
+        $registraMovimientoDeCaja = $tipo !== TipoComprobanteInterno::RemitoX
+            && collect($this->payments)->contains(fn ($p) => (float) $p['amount'] > 0);
+
+        if ($registraMovimientoDeCaja && ! CashLinker::hasOpenSession()) {
+            $this->addError('payments', 'Tenés que abrir la caja antes de registrar un pago.');
+
+            return;
+        }
+
+        // Descuento por medio de pago, igual criterio que Pos\Index: solo
+        // existe cuando el comprobante queda pagado por completo en el
+        // momento, expresado como % único que se compone con el descuento
+        // propio de cada línea (manual). Antes esta pantalla nunca lo
+        // aplicaba — la misma venta cotizaba distinto según se cargara
+        // desde acá o desde Venta Rápida con el mismo medio de pago.
+        $totalConDescuento = $this->totalConDescuentoPorMedioDePago();
+        $aplicaDescuentoPorMedioDePago = $totalConDescuento !== null;
+        $totalFacturacion = round($this->total(), 2);
+        $descuentoPctPagoGlobal = $aplicaDescuentoPorMedioDePago && $totalFacturacion > 0
+            ? round((1 - $totalConDescuento / $totalFacturacion) * 100, 4)
+            : 0.0;
+
+        // Recién acá, pasadas todas las validaciones: una falla de
+        // validación legítima no debe dejar al usuario sin poder reintentar.
+        $this->submitted = true;
+
+        $invoice = InvoiceNumberGenerator::withLock($tipo->value, fn () => DB::transaction(function () use ($validItems, $tipo, $puntoVentaNumero, $descuentoPctPagoGlobal, $aplicaDescuentoPorMedioDePago) {
+            $invoice = Invoice::create([
+                'number' => InvoiceNumberGenerator::next($tipo->value, null, $puntoVentaNumero),
+                'client_id' => $this->client_id,
+                'punto_venta' => $puntoVentaNumero,
+                'tipo_comprobante_interno' => $tipo,
+                'issue_date' => $this->issue_date,
+                'due_date' => $this->due_date,
+                // El IVA ahora vive por ítem; se deja en 0 a nivel comprobante.
+                'tax_rate' => 0,
+                'notes' => $this->notes ?: null,
+                'status' => $this->status,
+            ]);
+
+            foreach ($validItems as $item) {
+                $invoice->items()->create([
+                    'product_id' => $item['product_id'],
+                    'description' => $item['description'],
+                    'quantity' => $item['quantity'],
+                    'unit_price' => $item['unit_price'],
+                    // Descuento manual, combinado con el de medio de pago (si corresponde).
+                    'discount_percent' => $this->componerDescuentos((float) ($item['discount'] ?? 0), $descuentoPctPagoGlobal),
+                    'iva_rate' => $item['iva_rate'] ?? '21',
+                ]);
+            }
+
+            StockAdjuster::apply($validItems, $tipo->stockSign());
+
+            if ($tipo !== TipoComprobanteInterno::RemitoX) {
+                foreach ($this->payments as $payment) {
+                    if ((float) $payment['amount'] > 0) {
+                        $created = $invoice->payments()->create([
+                            'method' => $payment['method'],
+                            'amount' => $aplicaDescuentoPorMedioDePago ? $this->montoRealPago($payment) : $payment['amount'],
+                            'discount_amount' => $aplicaDescuentoPorMedioDePago
+                                ? round((float) $payment['amount'] - $this->montoRealPago($payment), 2)
+                                : 0,
+                        ]);
+
+                        $tipo === TipoComprobanteInterno::Devolucion
+                            ? CashLinker::linkInvoiceRefund($invoice, $created)
+                            : CashLinker::linkInvoicePayment($invoice, $created);
+                    }
+                }
+            }
+
+            return $invoice;
+        }), null, $puntoVentaNumero);
+
+        if ($this->printOnSave) {
+            $escposUrl = URL::temporarySignedRoute('invoices.ticket-escpos', now()->addMinutes(2), ['invoice' => $invoice]);
+            $this->js('printTicket('
+                .json_encode(route('invoices.ticket-print', $invoice)).','
+                .json_encode($escposUrl)
+                .')');
+        }
+
+        $this->redirect(route('invoices.show', $invoice), navigate: true);
+    }
+
+    public function render()
+    {
+        return view('livewire.invoices.create', [
+            'clients' => Client::forSelectCached(),
+            'statuses' => InvoiceStatus::cases(),
+            'paymentMethods' => PaymentMethod::cases(),
+            'tipoComprobanteInternoOptions' => CompanySettings::current()->tiposComprobanteSeleccionables(),
+            'priceLists' => config('features.price_lists') ? PriceList::activasParaSelectCached() : collect(),
+            'esNotaCredito' => false,
+            'ocultarIva' => CompanySettings::current()->debeOcultarIvaPorItem(),
+        ]);
+    }
+}

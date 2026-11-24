@@ -1,0 +1,230 @@
+<?php
+
+namespace App\Livewire\StockTransfers;
+
+use App\Livewire\Concerns\ScopedToSucursal;
+use App\Models\Product;
+use App\Models\ProductStock;
+use App\Models\StockTransfer;
+use App\Models\Sucursal;
+use App\Support\CurrentSucursal;
+use App\Support\StockAdjuster;
+use Illuminate\Support\Facades\DB;
+use Livewire\Attributes\Computed;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+use Livewire\WithPagination;
+use RuntimeException;
+
+/**
+ * Envío de mercadería entre sucursales: resta stock de una y suma en la otra
+ * como una sola operación, en vez de dos Ajustes de Stock sueltos y sin
+ * relación entre sí.
+ */
+#[Layout('layouts.app')]
+class Index extends Component
+{
+    use ScopedToSucursal;
+    use WithPagination;
+
+    public string $from_sucursal_id = '';
+
+    public string $to_sucursal_id = '';
+
+    public string $notes = '';
+
+    /** @var array<int, array{product_id: int, description: string, quantity: string}> */
+    public array $items = [];
+
+    public string $productQuery = '';
+
+    public function mount(): void
+    {
+        $this->from_sucursal_id = (string) CurrentSucursal::id();
+    }
+
+    /**
+     * Un cajero/vendedor solo puede enviar DESDE su propia sucursal, no
+     * elegir otra. Delega en ScopedToSucursal (antes solo chequeaba el rol,
+     * sin el flag features.multisucursal — mismo bug ya corregido en
+     * Dashboard/Reports/Audit/Invoices/ProductBatches).
+     */
+    public function puedeElegirOrigen(): bool
+    {
+        return $this->puedeVerTodasLasSucursales();
+    }
+
+    #[Computed]
+    public function productResults()
+    {
+        $term = trim($this->productQuery);
+
+        if ($term === '') {
+            return collect();
+        }
+
+        // MEJORA: la vista muestra el stock por sucursal de cada resultado
+        // ($product->stockEnSucursal()), que cae a una query individual si
+        // 'stocks' no está precargada - sin este with(), hasta 8 queries
+        // extra por cada tecleo (debounced) en el buscador.
+        return Product::where('name', 'like', "%{$term}%")
+            ->orWhere('sku', 'like', "%{$term}%")
+            ->with('stocks')
+            ->limit(8)
+            ->get();
+    }
+
+    public function addProductItem(int $productId): void
+    {
+        if (collect($this->items)->contains('product_id', $productId)) {
+            $this->productQuery = '';
+
+            return;
+        }
+
+        $product = Product::findOrFail($productId);
+
+        $this->items[] = [
+            'product_id' => $product->id,
+            'description' => $product->name,
+            'quantity' => '1',
+        ];
+
+        $this->productQuery = '';
+    }
+
+    public function removeItem(int $index): void
+    {
+        unset($this->items[$index]);
+        $this->items = array_values($this->items);
+    }
+
+    public function save(): void
+    {
+        // Un cajero/vendedor no elige origen en la UI, pero wire:model igual
+        // expone la propiedad en el payload — no confiar en lo que mande el
+        // cliente para este campo si no tiene permiso de elegirlo, o podría
+        // forzar un envío "desde" una sucursal donde no está.
+        if (! $this->puedeElegirOrigen()) {
+            $this->from_sucursal_id = (string) CurrentSucursal::id();
+        }
+
+        if ($this->from_sucursal_id === '') {
+            $this->addError('to_sucursal_id', 'No hay ninguna sucursal de origen resoluble.');
+
+            return;
+        }
+
+        $rules = [
+            'to_sucursal_id' => ['required', 'exists:sucursales,id', 'different:from_sucursal_id'],
+            'notes' => ['nullable', 'string', 'max:500'],
+            'items' => ['required', 'array', 'min:1'],
+            'items.*.quantity' => ['required', 'integer', 'min:1'],
+        ];
+
+        if ($this->puedeElegirOrigen()) {
+            $rules['from_sucursal_id'] = ['required', 'exists:sucursales,id', 'different:to_sucursal_id'];
+        }
+
+        $this->validate($rules, [
+            'to_sucursal_id.different' => 'El destino tiene que ser distinto del origen.',
+            'from_sucursal_id.different' => 'El origen tiene que ser distinto del destino.',
+            'items.required' => 'Agregá al menos un producto.',
+        ]);
+
+        $fromId = (int) $this->from_sucursal_id;
+        $toId = (int) $this->to_sucursal_id;
+
+        // No tiene sentido "enviar" más de lo que físicamente hay en el
+        // origen (a diferencia de una venta, acá no hay una razón de negocio
+        // para permitirlo — sería mover algo que no existe). Este primer
+        // chequeo es solo para dar feedback rápido por campo; el que de
+        // verdad importa es el de adentro de la transacción, con el stock
+        // lockeado.
+        $productIds = collect($this->items)->pluck('product_id')->filter()->unique()->all();
+        $products = Product::whereIn('id', $productIds)
+            ->with(['stocks' => fn ($q) => $q->where('sucursal_id', $fromId)])
+            ->get()
+            ->keyBy('id');
+
+        foreach ($this->items as $index => $item) {
+            $product = $products->get($item['product_id']);
+            $disponible = $product?->stockEnSucursal($fromId) ?? 0;
+
+            if ((int) $item['quantity'] > $disponible) {
+                $this->addError("items.{$index}.quantity", "Solo hay {$disponible} en la sucursal de origen.");
+
+                return;
+            }
+        }
+
+        // Solo se descuenta del ORIGEN acá. El destino recién se acredita
+        // cuando alguien ahí confirma qué recibió (StockTransfers\Show):
+        // puede diferir de lo enviado por rotura o pérdida en el traslado,
+        // y así no aparece "stock fantasma" en destino antes de llegar.
+        try {
+            DB::transaction(function () use ($fromId, $toId) {
+                $transfer = StockTransfer::create([
+                    'from_sucursal_id' => $fromId,
+                    'to_sucursal_id' => $toId,
+                    'user_id' => auth()->id(),
+                    'notes' => $this->notes ?: null,
+                ]);
+
+                foreach ($this->items as $item) {
+                    // Re-chequeo de disponibilidad con la fila de stock
+                    // LOCKEADA: el de arriba (sin lock, antes de la
+                    // transacción) es solo una guía rápida para el usuario —
+                    // sin este segundo chequeo, un doble clic (u otra
+                    // pestaña) puede disparar dos envíos simultáneos que
+                    // lean el mismo stock disponible y, entre los dos,
+                    // comprometan más de lo que hay físicamente en origen.
+                    $stockRow = ProductStock::where('product_id', $item['product_id'])
+                        ->where('sucursal_id', $fromId)
+                        ->lockForUpdate()
+                        ->first();
+
+                    $disponible = $stockRow?->stock ?? 0;
+
+                    if ((int) $item['quantity'] > $disponible) {
+                        throw new RuntimeException('El stock disponible cambió mientras se procesaba el envío. Revisá las cantidades y reintentá.');
+                    }
+
+                    $transfer->items()->create([
+                        'product_id' => $item['product_id'],
+                        'quantity' => $item['quantity'],
+                    ]);
+
+                    StockAdjuster::applyManualDelta($item['product_id'], -(int) $item['quantity'], $fromId);
+                }
+            });
+        } catch (RuntimeException $e) {
+            $this->addError('items', $e->getMessage());
+
+            return;
+        }
+
+        session()->flash('status', 'Envío registrado. Queda pendiente hasta que confirmen la recepción en destino.');
+        $this->reset(['to_sucursal_id', 'notes', 'items', 'productQuery']);
+    }
+
+    public function render()
+    {
+        $activeSucursalId = CurrentSucursal::id();
+
+        $transfers = StockTransfer::with(['fromSucursal', 'toSucursal', 'user', 'items.product'])
+            ->where(fn ($q) => $q->where('from_sucursal_id', $activeSucursalId)->orWhere('to_sucursal_id', $activeSucursalId))
+            ->latest('created_at')
+            ->paginate(20);
+
+        return view('livewire.stock-transfers.index', [
+            'transfers' => $transfers,
+            // No se usa Sucursal::forSelectCached() a propósito: esa trae
+            // TODAS las sucursales sin filtrar por 'active', y acá no
+            // corresponde poder enviar hacia/desde una sucursal inactiva.
+            'sucursales' => Sucursal::activasParaSelectCached(),
+            'sucursalActiva' => CurrentSucursal::get(),
+            'puedeElegirOrigen' => $this->puedeElegirOrigen(),
+        ]);
+    }
+}

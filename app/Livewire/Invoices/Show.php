@@ -1,0 +1,477 @@
+<?php
+
+namespace App\Livewire\Invoices;
+
+use App\Enums\InvoiceStatus;
+use App\Enums\PaymentMethod;
+use App\Enums\TipoComprobanteInterno;
+use App\Exceptions\Afip\AfipConnectionException;
+use App\Exceptions\Afip\AfipRejectedException;
+use App\Exceptions\Afip\AfipValidationException;
+use App\Mail\InvoiceMail;
+use App\Models\CompanySettings;
+use App\Models\Invoice;
+use App\Services\Afip\InvoiceCaeEmitter;
+use App\Services\MercadoPago\MercadoPagoQrService;
+use App\Support\CashLinker;
+use App\Support\CurrentSucursal;
+use App\Support\MercadoPagoPaymentApplier;
+use App\Support\RemitoFacturador;
+use App\Support\StockAdjuster;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\URL;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+use RuntimeException;
+
+#[Layout('layouts.app')]
+class Show extends Component
+{
+    public Invoice $invoice;
+
+    public ?string $afipError = null;
+
+    // --- Cobro con QR de Mercado Pago ---
+    public bool $showQrModal = false;
+
+    public ?string $qrImage = null;
+
+    public string $qrState = 'idle'; // idle | waiting | paid | error
+
+    public ?string $qrError = null;
+
+    // --- Entregar y cobrar (pedido de tienda online retirado en el mostrador) ---
+    public bool $showEntregaModal = false;
+
+    public string $entregaTipoComprobante = 'factura_b';
+
+    public string $entregaMetodoPago = 'efectivo';
+
+    public ?string $entregaError = null;
+
+    public function mount(Invoice $invoice): void
+    {
+        // Antes cualquier rol podía abrir la factura de cualquier sucursal
+        // con solo cambiar el id en la URL — el listado ya filtra, pero eso
+        // no protege el acceso directo.
+        abort_unless(
+            Auth::user()?->esAdminGlobal() || $invoice->sucursal_id === CurrentSucursal::id(),
+            403,
+            'No podés ver una factura de otra sucursal.'
+        );
+
+        $this->invoice = $invoice;
+    }
+
+    /**
+     * URL firmada (vence en minutos) del ticket ESC/POS, para que el agente
+     * de impresión local (ver pos-print-agent/) lo baje sin necesitar sesión
+     * de navegador. Ver TicketEscPosController.
+     */
+    public function ticketEscPosUrl(): string
+    {
+        return URL::temporarySignedRoute('invoices.ticket-escpos', now()->addMinutes(2), ['invoice' => $this->invoice]);
+    }
+
+    public function mpConfigured(): bool
+    {
+        return app(MercadoPagoQrService::class)->isConfigured($this->invoice->sucursal_id);
+    }
+
+    /**
+     * Empuja el monto de la factura a la caja de Mercado Pago y abre el modal
+     * con el QR. A partir de acá, quien escanee el QR de la pared ve el importe.
+     */
+    public function startQrCharge(): void
+    {
+        $this->qrError = null;
+        $this->qrImage = null;
+
+        if ($this->invoice->status === InvoiceStatus::Paid) {
+            $this->qrError = 'La factura ya está pagada.';
+
+            return;
+        }
+
+        $mp = app(MercadoPagoQrService::class);
+
+        try {
+            // Si ya había un cobro QR iniciado antes (el cajero cerró la
+            // pantalla y volvió más tarde), reconciliamos esa referencia
+            // vieja antes de pisarla: createOrder() sobreescribe
+            // mp_external_reference, y si el cliente pagó esa orden vieja
+            // mientras tanto, ni el polling ni el webhook la van a encontrar
+            // nunca más porque ya no queda ningún lado que la busque.
+            if ($this->invoice->mp_external_reference) {
+                $estadoPrevio = $mp->paymentStatus($this->invoice->mp_external_reference, $this->invoice->sucursal_id);
+
+                if ($estadoPrevio === 'paid') {
+                    $this->showQrModal = true;
+                    $this->markPaidFromQr();
+
+                    return;
+                }
+            }
+
+            $reference = $mp->createOrder($this->invoice);
+            $this->invoice->update(['mp_external_reference' => $reference]);
+
+            $data = $mp->ensureStoreAndPos($this->invoice->sucursal_id);
+            $this->qrImage = $data['qr_image'];
+            $this->qrState = 'waiting';
+            $this->showQrModal = true;
+        } catch (\Throwable $e) {
+            $this->qrState = 'error';
+            $this->qrError = 'No se pudo iniciar el cobro: '.$e->getMessage();
+            $this->showQrModal = true;
+        }
+    }
+
+    /**
+     * La pantalla llama a esto cada pocos segundos mientras espera el pago.
+     */
+    public function pollQr(): void
+    {
+        if ($this->qrState !== 'waiting' || ! $this->invoice->mp_external_reference) {
+            return;
+        }
+
+        $status = app(MercadoPagoQrService::class)->paymentStatus($this->invoice->mp_external_reference, $this->invoice->sucursal_id);
+
+        if ($status === 'paid') {
+            $this->markPaidFromQr();
+        }
+    }
+
+    private function markPaidFromQr(): void
+    {
+        MercadoPagoPaymentApplier::apply($this->invoice);
+
+        $this->qrState = 'paid';
+    }
+
+    public function cancelQrCharge(): void
+    {
+        try {
+            app(MercadoPagoQrService::class)->cancelOrder($this->invoice->sucursal_id);
+        } catch (\Throwable $e) {
+            // Si falla el borrado del pedido no bloqueamos el cierre del modal.
+        }
+
+        $this->closeQrModal();
+    }
+
+    public function closeQrModal(): void
+    {
+        $this->showQrModal = false;
+        $this->qrState = 'idle';
+        $this->qrImage = null;
+        $this->qrError = null;
+    }
+
+    public function setStatus(string $status): void
+    {
+        // Mismo chequeo que delete() de este componente: cambiar el estado a
+        // mano (ej. marcar "Pagado" sin que haya entrado la plata a caja) es
+        // una acción administrativa igual de consecuente que borrar, sin
+        // control de rol quedaba abierta a cualquiera con acceso al módulo.
+        abort_unless(Auth::user()->puedeEliminar(), 403, 'Tu rol no tiene permiso para cambiar el estado de un comprobante.');
+
+        if ($this->invoice->isFiscal && $status === InvoiceStatus::Draft->value) {
+            $this->addError('status', 'No se puede volver a borrador una factura que ya tiene CAE.');
+
+            return;
+        }
+
+        // Al salir de borrador la factura empieza a contar como deuda real
+        // (ver Client::saldoCuentaCorriente), así que ahí es donde hay que
+        // chequear el límite de crédito, igual que al crearla.
+        $tipo = $this->invoice->tipo_comprobante_interno;
+        if ($this->invoice->status === InvoiceStatus::Draft
+            && $status !== InvoiceStatus::Draft->value
+            && ! $tipo->esNotaCredito()
+            && $tipo !== TipoComprobanteInterno::Devolucion) {
+            $pendiente = round((float) $this->invoice->total - (float) $this->invoice->payments->sum('amount'), 2);
+            $cliente = $this->invoice->client;
+
+            if ($pendiente > 0.009 && $cliente && ($excesoMsg = $cliente->excesoDeCredito($pendiente))) {
+                $this->addError('status', $excesoMsg);
+
+                return;
+            }
+        }
+
+        $this->invoice->update(['status' => $status]);
+    }
+
+    /**
+     * Tipos a los que se puede entregar: Remito X (queda como comprobante
+     * final, sin pasar por AFIP — no toda venta online necesita factura) +
+     * las fiscales habilitadas. A diferencia de FacturarRemito (que solo
+     * ofrece fiscales, porque ahí el remito YA está pagado de otra forma),
+     * acá "entregar" y "facturar" son la misma decisión.
+     */
+    private function entregaTiposDestino(): array
+    {
+        return array_values(array_filter(
+            CompanySettings::current()->tiposComprobanteSeleccionables(),
+            fn (TipoComprobanteInterno $t) => ! $t->esNotaCredito() && $t !== TipoComprobanteInterno::Devolucion,
+        ));
+    }
+
+    public function openEntregaModal(): void
+    {
+        $default = CompanySettings::current()->tipoComprobantePorDefecto();
+        $this->entregaTipoComprobante = $default->esFiscal() ? $default->value : TipoComprobanteInterno::FacturaB->value;
+        $this->entregaMetodoPago = 'efectivo';
+        $this->entregaError = null;
+        $this->showEntregaModal = true;
+    }
+
+    public function closeEntregaModal(): void
+    {
+        $this->showEntregaModal = false;
+    }
+
+    /**
+     * Acción única para cuando el cliente pasa a buscar y paga un pedido
+     * online en el mostrador: carga el pago completo elegido (se anota en
+     * caja) y marca el pedido retirado — todo junto, en vez de obligar a
+     * pasar por "Facturar remito" + "Editar" + "Marcar retirado" en
+     * pantallas separadas (ver feedback del usuario). Si se elige un tipo
+     * fiscal, además convierte el remito en factura; si se elige Remito X,
+     * el remito mismo queda como comprobante final — no toda venta online
+     * necesita pasar por AFIP. A propósito NO emite CAE a ARCA: eso sigue
+     * siendo manual, igual que para cualquier otra venta (ver InvoiceObserver).
+     */
+    public function entregarYCobrar(): void
+    {
+        abort_unless($this->invoice->esRemito() && $this->invoice->esDeTiendaOnline() && $this->invoice->tiendaPedido, 404);
+
+        $tipo = TipoComprobanteInterno::tryFrom($this->entregaTipoComprobante);
+
+        if (! $tipo || ! in_array($tipo, $this->entregaTiposDestino(), true)) {
+            $this->entregaError = 'Elegí un tipo de comprobante válido y habilitado.';
+
+            return;
+        }
+
+        $metodo = PaymentMethod::tryFrom($this->entregaMetodoPago);
+
+        if (! $metodo) {
+            $this->entregaError = 'Elegí un medio de pago.';
+
+            return;
+        }
+
+        $sucursalId = $this->invoice->sucursal_id;
+
+        if (! CashLinker::hasOpenSession($sucursalId)) {
+            $this->entregaError = 'Tenés que abrir la caja antes de cobrar.';
+
+            return;
+        }
+
+        try {
+            // Todo el check-then-act bajo un lock por factura: la rama
+            // Remito X de abajo no pasa por RemitoFacturador (que ya tiene
+            // su propio lock + re-chequeo de "¿ya se facturó?"), así que sin
+            // este lock un doble clic (o dos pestañas) en "Entregar y
+            // cobrar" con Remito X elegido podía crear dos pagos y dos
+            // movimientos de caja del mismo pedido.
+            $documento = Cache::lock("invoice:entregar:{$this->invoice->id}", 10)->block(5, function () use ($tipo, $metodo, $sucursalId) {
+                return DB::transaction(function () use ($tipo, $metodo, $sucursalId) {
+                    // Releído fresco adentro del lock: ambas ramas marcan
+                    // tiendaPedido.picked_up_at al final, así que es la señal
+                    // uniforme de "este pedido ya se entregó y cobró",
+                    // válida tanto para la rama Remito X como para la fiscal.
+                    $invoice = $this->invoice->fresh('tiendaPedido');
+                    $tiendaPedido = $invoice->tiendaPedido;
+
+                    if ($tiendaPedido?->picked_up_at !== null) {
+                        throw new RuntimeException('Este pedido ya fue entregado y cobrado.');
+                    }
+
+                    $esRemitoX = $tipo === TipoComprobanteInterno::RemitoX;
+                    $documento = $esRemitoX ? $invoice : RemitoFacturador::facturar($invoice, $tipo);
+
+                    $pago = $documento->payments()->create([
+                        'method' => $metodo->value,
+                        'amount' => $documento->total,
+                    ]);
+
+                    CashLinker::linkInvoicePayment($documento, $pago, $sucursalId);
+
+                    if ($esRemitoX) {
+                        // Update por query builder (no dispara InvoiceObserver):
+                        // si se usara $documento->update() acá, el Observer vería
+                        // "remito online que pasó a Paid" y lo convertiría solo a
+                        // factura — justo lo que esta rama eligió NO hacer. Para
+                        // una Factura (rama de abajo) no hace falta este cuidado:
+                        // esRemito() ya da false ahí, el Observer no actúa.
+                        Invoice::where('id', $documento->id)->update(['status' => InvoiceStatus::Paid->value]);
+                        $documento->refresh();
+                    } else {
+                        $documento->update(['status' => InvoiceStatus::Paid]);
+                    }
+
+                    $tiendaPedido?->update(['picked_up_at' => now(), 'status' => 'paid']);
+
+                    return $documento;
+                });
+            });
+        } catch (RuntimeException $e) {
+            $this->entregaError = $e->getMessage();
+
+            return;
+        }
+
+        session()->flash('status', 'Pedido entregado y cobrado.');
+        $this->redirect(route('invoices.show', $documento), navigate: true);
+    }
+
+    /**
+     * Separado del pago a propósito (ver TiendaPedido::estaRetirado()): un
+     * pedido online puede estar pagado y sin retirar todavía, o pagarse
+     * recién en el mostrador junto con la entrega — no son el mismo paso.
+     */
+    public function toggleRetirado(): void
+    {
+        abort_unless($this->invoice->esDeTiendaOnline() && $this->invoice->tiendaPedido, 404);
+
+        $this->invoice->tiendaPedido->update([
+            'picked_up_at' => $this->invoice->tiendaPedido->estaRetirado() ? null : now(),
+        ]);
+
+        $this->invoice->load('tiendaPedido');
+    }
+
+    public function emitirAfip(): void
+    {
+        $this->afipError = null;
+
+        try {
+            $this->invoice = app(InvoiceCaeEmitter::class)->emit($this->invoice);
+        } catch (AfipRejectedException $e) {
+            $this->afipError = $e->getMessage();
+        } catch (AfipValidationException $e) {
+            $this->afipError = $e->getMessage();
+        } catch (AfipConnectionException $e) {
+            $this->afipError = 'No se pudo contactar a ARCA, reintentá en unos minutos.';
+        } catch (RuntimeException $e) {
+            // InvoiceCaeEmitter ya serializa la emisión con un lock propio y
+            // re-chequea el CAE adentro — esto solo salta si un doble clic
+            // (u otra pestaña) alcanzó a emitir primero. No es un error real:
+            // refrescamos la factura para mostrar el CAE que ya se obtuvo.
+            $this->invoice->refresh();
+
+            if (! $this->invoice->isFiscal) {
+                $this->afipError = $e->getMessage();
+            }
+        }
+    }
+
+    public function enviarPorEmail(): void
+    {
+        $cliente = $this->invoice->client;
+
+        if (! $cliente || ! $cliente->email) {
+            session()->flash('error', 'El cliente no tiene un email cargado.');
+
+            return;
+        }
+
+        try {
+            Mail::to($cliente->email)->send(new InvoiceMail($this->invoice));
+            session()->flash('status', 'Factura enviada por email a '.$cliente->email.'.');
+        } catch (\Throwable $e) {
+            session()->flash('error', 'No se pudo enviar el email: '.$e->getMessage());
+        }
+    }
+
+    /**
+     * Link de WhatsApp con un mensaje ya escrito. Null si el cliente no tiene
+     * teléfono. WhatsApp no permite adjuntar el PDF por link, así que va el
+     * resumen; el PDF se manda por email o se descarga.
+     */
+    public function whatsappUrl(): ?string
+    {
+        $telefono = preg_replace('/\D/', '', (string) ($this->invoice->client->phone ?? ''));
+
+        if ($telefono === '') {
+            return null;
+        }
+
+        $mensaje = "Hola {$this->invoice->client->name}, te paso tu factura {$this->invoice->number} por un total de $".money((float) $this->invoice->total).'. ¡Gracias!';
+
+        return 'https://wa.me/'.$telefono.'?text='.rawurlencode($mensaje);
+    }
+
+    public function delete(): void
+    {
+        // Borrar revierte stock y desvincula pagos de caja — un impacto
+        // real en plata/stock que Cajero y Vendedor no deberían poder
+        // disparar solos (a diferencia de emitirAfip(), que sí les queda
+        // habilitado). Solo Admin/Encargado.
+        abort_unless(
+            Auth::user()?->esAdminGlobal() || Auth::user()?->esEncargado(),
+            403,
+            'Tu rol no tiene permiso para eliminar comprobantes.'
+        );
+
+        abort_if($this->invoice->isFiscal, 403, 'No se puede eliminar una factura con CAE. Emití una Nota de Crédito.');
+        abort_if(
+            $this->invoice->esRemito() && $this->invoice->facturaGenerada() !== null,
+            403,
+            'Este remito ya fue facturado, no se puede eliminar: eliminá o corregí la factura generada primero.'
+        );
+
+        // Mismo mecanismo que Purchases\Show::delete(): un doble clic en
+        // "Eliminar" puede disparar dos requests que reviertan el stock dos
+        // veces antes de que la primera termine de borrar el comprobante.
+        $invoiceId = $this->invoice->id;
+
+        Cache::lock("comprobante:eliminar:{$invoiceId}", 10)->block(5, function () use ($invoiceId) {
+            DB::transaction(function () use ($invoiceId) {
+                $invoice = Invoice::with('items', 'payments')->find($invoiceId);
+
+                if (! $invoice) {
+                    return; // Ya se borró en otro request (doble clic).
+                }
+
+                $items = $invoice->items->map(fn ($item) => [
+                    'product_id' => $item->product_id,
+                    'quantity' => (float) $item->quantity,
+                ])->all();
+                $sign = $invoice->afecta_stock ? $invoice->tipo_comprobante_interno->stockSign() : 0;
+                // La sucursal de la factura, no la activa de quien la borra (un
+                // admin global puede borrar la de cualquier sucursal, ver
+                // mount()) — mismo criterio que Invoices\Edit::save().
+                StockAdjuster::apply($items, -$sign, $invoice->sucursal_id);
+
+                $invoice->payments->each(fn ($payment) => CashLinker::unlinkInvoicePayment($payment));
+
+                $invoice->delete();
+            });
+        });
+
+        session()->flash('status', 'Comprobante eliminado.');
+        $this->redirect(route('invoices.index'), navigate: true);
+    }
+
+    public function render()
+    {
+        $this->invoice->load('client', 'items', 'payments', 'relatedInvoice', 'creditNotes', 'facturasDelRemito', 'tiendaPedido');
+
+        return view('livewire.invoices.show', [
+            'statuses' => InvoiceStatus::cases(),
+            'mpConfigured' => $this->mpConfigured(),
+            'pollSeconds' => (int) config('mercadopago.poll_seconds', 3),
+            'entregaTiposDestino' => $this->entregaTiposDestino(),
+            'entregaMetodosPago' => PaymentMethod::cases(),
+        ]);
+    }
+}

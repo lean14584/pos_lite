@@ -1,0 +1,217 @@
+<?php
+
+namespace App\Livewire\StockAdjustments;
+
+use App\Enums\StockAdjustmentReason;
+use App\Livewire\Concerns\ScopedToSucursal;
+use App\Models\Product;
+use App\Models\ProductStock;
+use App\Models\StockAdjustment;
+use App\Support\CurrentSucursal;
+use App\Support\Permissions;
+use App\Support\StockAdjuster;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Livewire\Attributes\Computed;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Url;
+use Livewire\Component;
+use Livewire\WithPagination;
+
+#[Layout('layouts.app')]
+class Index extends Component
+{
+    use ScopedToSucursal;
+    use WithPagination;
+
+    public string $product_id = '';
+
+    public string $productQuery = '';
+
+    public string $new_stock = '';
+
+    /** Stock del producto al momento de elegirlo, para poder aplicar el ajuste como delta (ver save()). */
+    public string $baseline_stock = '';
+
+    public string $reason = 'conteo_fisico';
+
+    public string $notes = '';
+
+    #[Url]
+    public string $filterProduct = '';
+
+    public string $filterProductQuery = '';
+
+    #[Url]
+    public string $desde = '';
+
+    #[Url]
+    public string $hasta = '';
+
+    public function updating(string $name): void
+    {
+        if (in_array($name, ['desde', 'hasta'], true)) {
+            $this->resetPage();
+        }
+    }
+
+    /** Precarga el stock actual del producto elegido EN LA SUCURSAL ACTIVA, para partir de un valor real. */
+    public function updatedProductId(): void
+    {
+        $product = $this->product_id !== '' ? Product::find($this->product_id) : null;
+        $this->new_stock = $product ? (string) $product->stockEnSucursal(CurrentSucursal::id()) : '';
+        $this->baseline_stock = $this->new_stock;
+    }
+
+    #[Computed]
+    public function productResults()
+    {
+        $term = trim($this->productQuery);
+
+        if ($term === '') {
+            return collect();
+        }
+
+        return Product::where('name', 'like', "%{$term}%")
+            ->orWhere('sku', 'like', "%{$term}%")
+            ->limit(8)
+            ->get();
+    }
+
+    public function selectProduct(int $productId): void
+    {
+        $this->productQuery = '';
+        $this->product_id = (string) $productId;
+        $this->updatedProductId();
+    }
+
+    #[Computed]
+    public function filterProductResults()
+    {
+        $term = trim($this->filterProductQuery);
+
+        if ($term === '') {
+            return collect();
+        }
+
+        return Product::where('name', 'like', "%{$term}%")
+            ->orWhere('sku', 'like', "%{$term}%")
+            ->limit(8)
+            ->get();
+    }
+
+    public function selectFilterProduct(int $productId): void
+    {
+        $this->filterProductQuery = '';
+        $this->filterProduct = (string) $productId;
+        $this->resetPage();
+    }
+
+    public function clearFilterProduct(): void
+    {
+        $this->filterProduct = '';
+        $this->filterProductQuery = '';
+        $this->resetPage();
+    }
+
+    protected function rules(): array
+    {
+        return [
+            'product_id' => ['required', 'exists:products,id'],
+            'new_stock' => ['required', 'integer', 'min:0'],
+            'reason' => ['required', 'in:'.implode(',', array_column(StockAdjustmentReason::cases(), 'value'))],
+            'notes' => ['nullable', 'string', 'max:500'],
+        ];
+    }
+
+    public function save(): void
+    {
+        // Defensa en profundidad: la ruta ya exige module:stock-adjustments
+        // (y Livewire la revalida en cada acción, ver AppServiceProvider), pero
+        // un ajuste de stock cambia stock real — vale la pena no depender de
+        // una sola capa, igual criterio que Products\Index::canManageProducts.
+        abort_unless(Permissions::canAccess(Auth::user()->role, 'stock-adjustments'), 403);
+
+        $this->validate();
+
+        $sucursalId = CurrentSucursal::id();
+
+        if ($sucursalId === null) {
+            $this->addError('product_id', 'No hay ninguna sucursal activa para ajustar stock.');
+
+            return;
+        }
+
+        // El usuario tipea el stock final que contó, relativo al valor que
+        // vio al elegir el producto (baseline_stock) EN ESTA sucursal.
+        // Aplicamos la diferencia como delta atómico (increment/decrement),
+        // no como un pisado de valor absoluto: si una venta descontó stock
+        // mientras esta pantalla estaba abierta, ese descuento no se pierde
+        // bajo el ajuste.
+        $delta = (int) $this->new_stock - (int) $this->baseline_stock;
+        $product = Product::findOrFail($this->product_id);
+
+        [$previous, $newStock] = DB::transaction(function () use ($product, $sucursalId, $delta) {
+            // Bloquea (o crea) la fila de product_stocks de esta sucursal
+            // antes de leer el valor base, para que el "antes" del log de
+            // auditoría sea exacto aunque una venta descuente stock casi al
+            // mismo tiempo que se guarda este ajuste.
+            $row = ProductStock::firstOrCreate(
+                ['product_id' => $product->id, 'sucursal_id' => $sucursalId],
+                ['stock' => 0]
+            );
+            $row = ProductStock::whereKey($row->id)->lockForUpdate()->firstOrFail();
+            $previous = $row->stock;
+
+            StockAdjuster::applyManualDelta($product->id, $delta, $sucursalId);
+
+            StockAdjustment::create([
+                'product_id' => $product->id,
+                'sucursal_id' => $sucursalId,
+                'user_id' => auth()->id(),
+                'previous_stock' => $previous,
+                'new_stock' => $previous + $delta,
+                'reason' => $this->reason,
+                'notes' => $this->notes ?: null,
+            ]);
+
+            return [$previous, $previous + $delta];
+        });
+
+        session()->flash('status', "Stock de \"{$product->name}\" ajustado de {$previous} a {$newStock}.");
+        $this->reset(['product_id', 'productQuery', 'new_stock', 'baseline_stock', 'notes']);
+        $this->reason = 'conteo_fisico';
+    }
+
+    public function render()
+    {
+        // MEJORA: esta query no filtraba por sucursal (a diferencia de todas
+        // sus pantallas hermanas - ProductBatches\Index, Purchases\Index,
+        // Invoices\Index, etc.), así que un vendedor/encargado veía los
+        // ajustes de stock de TODAS las sucursales, no solo la suya. save()
+        // sí escribía scoped a CurrentSucursal::id() - el hueco era solo de
+        // lectura acá.
+        $sucursalId = $this->puedeVerTodasLasSucursales() ? null : CurrentSucursal::id();
+
+        $adjustments = StockAdjustment::with(['product', 'user', 'sucursal'])
+            ->when($sucursalId !== null, fn ($q) => $q->where('sucursal_id', $sucursalId))
+            ->when($this->filterProduct !== '', fn ($q) => $q->where('product_id', $this->filterProduct))
+            // whereDate() envuelve la columna en DATE(...) e impide usar el
+            // índice de created_at — mismo criterio que LibroIvaCalculator.
+            // El corte superior usa "< día siguiente" para seguir siendo un
+            // rango sargable.
+            ->when($this->desde !== '', fn ($q) => $q->where('created_at', '>=', $this->desde))
+            ->when($this->hasta !== '', fn ($q) => $q->where('created_at', '<', Carbon::parse($this->hasta)->addDay()->toDateString()))
+            ->latest()
+            ->paginate(20);
+
+        return view('livewire.stock-adjustments.index', [
+            'adjustments' => $adjustments,
+            'selectedProductName' => $this->product_id !== '' ? Product::find($this->product_id)?->name : null,
+            'filterProductName' => $this->filterProduct !== '' ? Product::find($this->filterProduct)?->name : null,
+            'reasons' => StockAdjustmentReason::cases(),
+            'sucursalActiva' => CurrentSucursal::get(),
+        ]);
+    }
+}

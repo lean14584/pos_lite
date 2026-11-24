@@ -1,0 +1,121 @@
+@php
+    $numeroCompleto = fn ($row) => str_pad($row->puntoVenta, 4, '0', STR_PAD_LEFT).'-'.str_pad($row->numeroComprobante, 8, '0', STR_PAD_LEFT);
+@endphp
+
+<div class="p-8 max-w-6xl mx-auto">
+    <x-page-header title="Libro IVA Digital" subtitle="Comprobantes de ventas y compras del período, según el diseño de registro de ARCA (ex AFIP, RG 4597)" icon="receipt-percent">
+        <x-slot:actions>
+            <a href="{{ route('libro-iva.export', ['desde' => $fromDate, 'hasta' => $toDate]) }}" class="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-white shadow-sm shadow-emerald-900/20 hover:bg-emerald-400 active:scale-[0.98] transition-all">
+                <x-heroicon-o-arrow-down-tray class="w-4 h-4" /> Exportar (.zip)
+            </a>
+        </x-slot:actions>
+    </x-page-header>
+
+    <div class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-4 mb-6 flex flex-col sm:flex-row sm:items-end gap-3">
+        <div>
+            <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Desde</label>
+            <input type="date" wire:model.live="fromDate" class="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/60 dark:text-gray-100 px-3 py-2.5 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-400 focus:border-sky-400 transition">
+        </div>
+        <div>
+            <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Hasta</label>
+            <input type="date" wire:model.live="toDate" class="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/60 dark:text-gray-100 px-3 py-2.5 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-400 focus:border-sky-400 transition">
+        </div>
+
+        <div class="sm:ml-auto flex rounded-lg border border-gray-200 dark:border-gray-800 p-1 bg-gray-50 dark:bg-gray-800/50">
+            <button
+                type="button"
+                wire:click="$set('tab', 'ventas')"
+                class="px-4 py-1.5 text-sm font-medium rounded-md transition-colors {{ $tab === 'ventas' ? 'bg-white dark:bg-gray-900 text-sky-700 dark:text-sky-400 shadow-sm' : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200' }}"
+            >
+                Ventas
+            </button>
+            <button
+                type="button"
+                wire:click="$set('tab', 'compras')"
+                class="px-4 py-1.5 text-sm font-medium rounded-md transition-colors {{ $tab === 'compras' ? 'bg-white dark:bg-gray-900 text-sky-700 dark:text-sky-400 shadow-sm' : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200' }}"
+            >
+                Compras
+            </button>
+        </div>
+    </div>
+
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+        <x-stat-card label="Neto gravado" value="${{ money($totalNeto) }}" icon="banknotes" />
+        <x-stat-card label="IVA liquidado" value="${{ money($totalIva) }}" icon="receipt-percent" />
+        <x-stat-card label="Exento" value="${{ money($totalExento) }}" icon="no-symbol" color="gray" />
+        <x-stat-card label="Total" value="${{ money($totalGeneral) }}" icon="calculator" color="emerald" />
+    </div>
+
+    @if ($resumen->isNotEmpty())
+        <div class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-5 mb-6">
+            <h2 class="text-sm font-medium text-gray-900 dark:text-gray-100 mb-4">Resumen por alícuota</h2>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+                @foreach ($resumen as $item)
+                    <div>
+                        <p class="text-xs text-gray-400 dark:text-gray-500 uppercase">{{ rtrim(rtrim(number_format($item['tasa'], 2), '0'), '.') }}%</p>
+                        <p class="font-semibold text-gray-900 dark:text-gray-100">${{ money($item['iva']) }}</p>
+                        <p class="text-xs text-gray-500 dark:text-gray-400">neto ${{ money($item['netoGravado']) }}</p>
+                    </div>
+                @endforeach
+            </div>
+        </div>
+    @endif
+
+    <div class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm overflow-hidden">
+        @if ($rows->isEmpty())
+            <div class="p-12 text-center text-gray-400 dark:text-gray-500">
+                <x-heroicon-o-document-text class="w-10 h-10 mx-auto mb-3 text-gray-300 dark:text-gray-700" />
+                <p class="text-sm">No hay comprobantes {{ $tab === 'compras' ? 'de compra' : 'fiscales' }} en el período seleccionado.</p>
+            </div>
+        @else
+            <div class="hidden sm:block overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead class="bg-gray-50 dark:bg-gray-800/50">
+                    <tr class="text-left text-gray-500 dark:text-gray-400">
+                        <th class="px-4 py-2 font-medium">Fecha</th>
+                        <th class="px-4 py-2 font-medium">Comprobante</th>
+                        <th class="px-4 py-2 font-medium">{{ $tab === 'compras' ? 'Proveedor' : 'Cliente' }}</th>
+                        <th class="px-4 py-2 font-medium text-right">Neto gravado</th>
+                        <th class="px-4 py-2 font-medium text-right">Exento</th>
+                        <th class="px-4 py-2 font-medium text-right">IVA</th>
+                        <th class="px-4 py-2 font-medium text-right">Total</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach ($rows as $row)
+                        <tr wire:key="comprobante-{{ $row->tipoComprobante->value }}-{{ $numeroCompleto($row) }}" class="border-t border-gray-100 dark:border-gray-800">
+                            <td class="px-4 py-2 text-gray-700 dark:text-gray-300">{{ $row->fecha->format('d/m/Y') }}</td>
+                            <td class="px-4 py-2 text-gray-700 dark:text-gray-300">
+                                {{ $row->tipoComprobante->label() }}
+                                <span class="text-gray-400 dark:text-gray-500">· {{ $numeroCompleto($row) }}</span>
+                            </td>
+                            <td class="px-4 py-2 text-gray-700 dark:text-gray-300 truncate max-w-[220px]">{{ $row->denominacion }}</td>
+                            <td class="px-4 py-2 text-right text-gray-700 dark:text-gray-300">${{ money($row->importeNetoGravado) }}</td>
+                            <td class="px-4 py-2 text-right text-gray-500 dark:text-gray-400">${{ money($row->importeExento) }}</td>
+                            <td class="px-4 py-2 text-right text-gray-700 dark:text-gray-300">${{ money($row->ivaLiquidado) }}</td>
+                            <td class="px-4 py-2 text-right font-medium text-gray-900 dark:text-gray-100">${{ money($row->importeTotal) }}</td>
+                        </tr>
+                    @endforeach
+                </tbody>
+            </table>
+            </div>
+
+            <div class="sm:hidden divide-y divide-gray-100 dark:divide-gray-800">
+                @foreach ($rows as $row)
+                    <div wire:key="comprobante-card-{{ $row->tipoComprobante->value }}-{{ $numeroCompleto($row) }}" class="p-4">
+                        <div class="flex items-start justify-between gap-3">
+                            <p class="font-medium text-gray-900 dark:text-gray-100 truncate">{{ $row->denominacion }}</p>
+                            <p class="font-medium text-gray-900 dark:text-gray-100 shrink-0">${{ money($row->importeTotal) }}</p>
+                        </div>
+                        <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                            {{ $row->fecha->format('d/m/Y') }} · {{ $row->tipoComprobante->label() }} {{ $numeroCompleto($row) }}
+                        </p>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                            Neto ${{ money($row->importeNetoGravado) }} · Exento ${{ money($row->importeExento) }} · IVA ${{ money($row->ivaLiquidado) }}
+                        </p>
+                    </div>
+                @endforeach
+            </div>
+        @endif
+    </div>
+</div>

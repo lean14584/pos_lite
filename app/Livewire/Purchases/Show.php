@@ -1,0 +1,111 @@
+<?php
+
+namespace App\Livewire\Purchases;
+
+use App\Enums\InvoiceStatus;
+use App\Models\Purchase;
+use App\Support\CashLinker;
+use App\Support\CurrentSucursal;
+use App\Support\StockAdjuster;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+
+#[Layout('layouts.app')]
+class Show extends Component
+{
+    public Purchase $purchase;
+
+    public function mount(Purchase $purchase): void
+    {
+        // El listado ya filtra por sucursal, pero antes de esto el acceso
+        // directo a una compra puntual (cambiando el id en la URL) no
+        // chequeaba nada — mismo hueco que tenía Invoices\Show.
+        abort_unless(
+            Auth::user()?->esAdminGlobal() || $purchase->sucursal_id === CurrentSucursal::id(),
+            403,
+            'No tenés acceso a esta compra.'
+        );
+
+        $this->purchase = $purchase;
+    }
+
+    public function setStatus(string $status): void
+    {
+        // Mismo chequeo que delete() de este componente: cambiar el estado a
+        // mano es una acción administrativa igual de consecuente que borrar,
+        // sin control de rol quedaba abierta a cualquiera con acceso al módulo.
+        abort_unless(Auth::user()->puedeEliminar(), 403, 'Tu rol no tiene permiso para cambiar el estado de una compra.');
+
+        $this->purchase->update(['status' => $status]);
+    }
+
+    public function delete(): void
+    {
+        // Borrar revierte stock, da de baja lotes y desvincula pagos de
+        // caja — mismo impacto real en plata/stock que Invoices\Show, donde
+        // Cajero y Vendedor ya están excluidos. Acá faltaba ese mismo
+        // chequeo: solo Admin/Encargado.
+        abort_unless(
+            Auth::user()?->esAdminGlobal() || Auth::user()?->esEncargado(),
+            403,
+            'Tu rol no tiene permiso para eliminar compras.'
+        );
+
+        // Reversión de stock + baja de lotes + desvinculación de pagos tiene
+        // que ser una sola unidad atómica por compra: sin esto, un doble
+        // clic en "Eliminar" puede disparar dos requests que lean la compra
+        // todavía existente y reviertan el stock dos veces antes de que la
+        // primera termine de borrarla (mismo mecanismo ya arreglado en
+        // NotasCredito\Create y CashRegister\Index).
+        $purchaseId = $this->purchase->id;
+
+        Cache::lock("compra:eliminar:{$purchaseId}", 10)->block(5, function () use ($purchaseId) {
+            DB::transaction(function () use ($purchaseId) {
+                $purchase = Purchase::with('items', 'payments')->find($purchaseId);
+
+                if (! $purchase) {
+                    return; // Ya se borró en otro request (doble clic).
+                }
+
+                $items = $purchase->items->map(fn ($item) => [
+                    'product_id' => $item->product_id,
+                    'quantity' => (float) $item->quantity,
+                ])->all();
+
+                // La sucursal de la compra, no la activa de quien la borra
+                // ahora (ver migración add_sucursal_id_to_purchases_table).
+                StockAdjuster::apply($items, -1, $purchase->sucursal_id);
+
+                // MEJORA: los lotes de esta compra sobrevivían con purchase_id
+                // en null (nullOnDelete) y su quantity_remaining intacta, pese a
+                // que el stock que representaban ya se revirtió arriba — quedaban
+                // como lotes "fantasma" en Lotes y Vencimientos, y darlos de baja
+                // después descontaba stock que ya no existía.
+                $purchase->batches()->delete();
+
+                $purchase->payments->each(fn ($payment) => CashLinker::unlinkPurchasePayment($payment));
+
+                $purchase->delete();
+            });
+        });
+
+        session()->flash('status', 'Compra eliminada.');
+        $this->redirect(route('purchases.index'), navigate: true);
+    }
+
+    public function render()
+    {
+        // MEJORA: faltaba 'taxes' acá - la vista recorre $purchase->taxes en
+        // un @foreach, y Purchase::total() también las lee para calcular el
+        // total (percepcionesTotal()), disparando una query extra por cada
+        // apertura de esta pantalla.
+        $this->purchase->load('provider', 'items', 'payments', 'taxes');
+
+        return view('livewire.purchases.show', [
+            'statuses' => InvoiceStatus::cases(),
+        ]);
+    }
+}

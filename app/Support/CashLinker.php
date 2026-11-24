@@ -1,0 +1,202 @@
+<?php
+
+namespace App\Support;
+
+use App\Enums\CashMovementSource;
+use App\Enums\CashMovementType;
+use App\Models\CashMovement;
+use App\Models\CashSession;
+use App\Models\ClientPayment;
+use App\Models\Invoice;
+use App\Models\InvoicePayment;
+use App\Models\ProviderPayment;
+use App\Models\Purchase;
+use App\Models\PurchasePayment;
+
+class CashLinker
+{
+    /**
+     * La caja abierta DE QUIEN ESTÁ HACIENDO LA ACCIÓN, en la sucursal activa
+     * — no "la" caja abierta a secas. Desde que varios cajeros pueden tener
+     * cada uno su propia caja abierta al mismo tiempo en el mismo local, un
+     * cobro/pago tiene que quedar anotado en LA CAJA DE QUIEN LO HIZO, no en
+     * la de cualquier otro compañero que también tenga una abierta ahí.
+     */
+    private static function openSession(?int $sucursalId = null): ?CashSession
+    {
+        return CashSession::where('status', 'open')
+            ->where('sucursal_id', $sucursalId ?? CurrentSucursal::id())
+            ->where('user_id', auth()->id())
+            ->first();
+    }
+
+    /**
+     * Para chequear ANTES de registrar un cobro/pago si va a poder quedar
+     * anotado en caja — si no hay sesión abierta, linkX() no hace nada
+     * (return silencioso) y esa plata queda invisible para el arqueo. Los
+     * componentes que reciben plata en mano tienen que llamar a esto antes
+     * de confirmar la operación, no confiar en que linkX() avise.
+     */
+    public static function hasOpenSession(?int $sucursalId = null): bool
+    {
+        return self::openSession($sucursalId) !== null;
+    }
+
+    public static function linkClientPayment(ClientPayment $payment): void
+    {
+        $session = self::openSession();
+
+        if (! $session) {
+            return;
+        }
+
+        CashMovement::create([
+            'session_id' => $session->id,
+            'type' => CashMovementType::Ingreso,
+            'concept' => "Cobro a {$payment->client->name}",
+            'amount' => $payment->amount,
+            'source' => CashMovementSource::Venta,
+            'source_id' => "client_payment_{$payment->id}",
+            'date' => $payment->date,
+        ]);
+    }
+
+    public static function unlinkClientPayment(ClientPayment $payment): void
+    {
+        CashMovement::where('source_id', "client_payment_{$payment->id}")->delete();
+    }
+
+    public static function linkProviderPayment(ProviderPayment $payment): void
+    {
+        $session = self::openSession();
+
+        if (! $session) {
+            return;
+        }
+
+        CashMovement::create([
+            'session_id' => $session->id,
+            'type' => CashMovementType::Egreso,
+            'concept' => "Pago a {$payment->provider->name}",
+            'amount' => $payment->amount,
+            'source' => CashMovementSource::Compra,
+            'source_id' => "provider_payment_{$payment->id}",
+            'date' => $payment->date,
+        ]);
+    }
+
+    public static function unlinkProviderPayment(ProviderPayment $payment): void
+    {
+        CashMovement::where('source_id', "provider_payment_{$payment->id}")->delete();
+    }
+
+    /**
+     * $sucursalId explícito (Invoices\Edit/Show lo pasan al editar/eliminar
+     * una factura de otra sucursal) porque el cobro tiene que quedar
+     * anotado en la caja de la sucursal DE LA FACTURA, no en la sesión
+     * activa de quien esté operando ahora — mismo criterio que
+     * linkInvoiceRefund().
+     *
+     * Idempotente por diseño (chequea source_id antes de crear): a
+     * diferencia del resto de los callers, MercadoPagoPaymentApplier llama
+     * esto en cada reintento (webhook y polling pueden dispararse los dos
+     * para el mismo pago, y el webhook no tiene usuario autenticado — acá
+     * no hace nada — así que el polling necesita poder reintentar el link
+     * aunque el InvoicePayment ya exista de antes).
+     */
+    public static function linkInvoicePayment(Invoice $invoice, InvoicePayment $payment, ?int $sucursalId = null): void
+    {
+        // A propósito NO se excluye acá a las ventas de la tienda online por
+        // esDeTiendaOnline(): esta misma función es el único camino para
+        // anotar en caja un pago en efectivo/tarjeta que un cajero carga a
+        // mano cuando el cliente pasa a retirar y pagar un pedido online en
+        // el mostrador (ver Invoices\Edit) — eso SÍ es plata real en el
+        // cajón y tiene que quedar en el arqueo. Lo que nunca debe tocar
+        // caja es el pago AUTOMÁTICO que confirma el webhook de Mercado
+        // Pago de la tienda — y ESO ya queda afuera solo con el chequeo de
+        // sesión de abajo: el request del webhook nunca tiene un usuario de
+        // staff autenticado (es un POST público, sin cookie de sesión), así
+        // que openSession() da null ahí siempre, sin excepción — no depende
+        // de que algún cajero tenga o no una caja abierta en paralelo.
+        if (CashMovement::where('source_id', "invoice_payment_{$payment->id}")->exists()) {
+            return;
+        }
+
+        $session = self::openSession($sucursalId);
+
+        if (! $session) {
+            return;
+        }
+
+        CashMovement::create([
+            'session_id' => $session->id,
+            'type' => CashMovementType::Ingreso,
+            'concept' => "Venta {$invoice->number} · {$invoice->client->name} · {$payment->method->label()}",
+            'amount' => $payment->amount,
+            'source' => CashMovementSource::Venta,
+            'source_id' => "invoice_payment_{$payment->id}",
+            'date' => $invoice->issue_date,
+        ]);
+    }
+
+    /**
+     * Devolución: el dinero sale de caja, no entra. $sucursalId explícito
+     * (NotasCredito\Create lo pasa) porque la caja de una devolución es la
+     * de la sucursal de la factura ORIGINAL, no la sesión activa de quien
+     * procesa la devolución ahora.
+     */
+    public static function linkInvoiceRefund(Invoice $invoice, InvoicePayment $payment, ?int $sucursalId = null): void
+    {
+        $session = self::openSession($sucursalId);
+
+        if (! $session) {
+            return;
+        }
+
+        CashMovement::create([
+            'session_id' => $session->id,
+            'type' => CashMovementType::Egreso,
+            'concept' => "Devolución {$invoice->number} · {$invoice->client->name}",
+            'amount' => $payment->amount,
+            'source' => CashMovementSource::Devolucion,
+            'source_id' => "invoice_payment_{$payment->id}",
+            'date' => $invoice->issue_date,
+        ]);
+    }
+
+    public static function unlinkInvoicePayment(InvoicePayment $payment): void
+    {
+        CashMovement::where('source_id', "invoice_payment_{$payment->id}")->delete();
+    }
+
+    /**
+     * Método de pago cargado al momento de registrar la compra (distinto de
+     * ProviderPayment, que salda saldo pendiente de cuenta corriente después).
+     *
+     * $sucursalId explícito (Purchases\Edit lo pasa al editar una compra de
+     * otra sucursal) — mismo criterio que linkInvoicePayment/linkInvoiceRefund.
+     */
+    public static function linkPurchasePayment(Purchase $purchase, PurchasePayment $payment, ?int $sucursalId = null): void
+    {
+        $session = self::openSession($sucursalId);
+
+        if (! $session) {
+            return;
+        }
+
+        CashMovement::create([
+            'session_id' => $session->id,
+            'type' => CashMovementType::Egreso,
+            'concept' => "Compra {$purchase->number} · {$purchase->provider->name} · {$payment->method->label()}",
+            'amount' => $payment->amount,
+            'source' => CashMovementSource::Compra,
+            'source_id' => "purchase_payment_{$payment->id}",
+            'date' => $purchase->issue_date,
+        ]);
+    }
+
+    public static function unlinkPurchasePayment(PurchasePayment $payment): void
+    {
+        CashMovement::where('source_id', "purchase_payment_{$payment->id}")->delete();
+    }
+}

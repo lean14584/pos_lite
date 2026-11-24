@@ -1,0 +1,566 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Enums\Role;
+use App\Models\CashMovement;
+use App\Models\CashSession;
+use App\Models\Client;
+use App\Models\CompanySettings;
+use App\Models\Invoice;
+use App\Models\Product;
+use App\Models\Sucursal;
+use App\Models\TiendaPedido;
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Storage;
+use Livewire\Livewire;
+use Tests\TestCase;
+
+class InvoicesTest extends TestCase
+{
+    use RefreshDatabase;
+
+    private function admin(): User
+    {
+        return User::factory()->create(['role' => Role::Admin, 'active' => true]);
+    }
+
+    public function test_el_formulario_de_nueva_factura_preselecciona_consumidor_final(): void
+    {
+        $component = Livewire::actingAs($this->admin())->test('invoices.create');
+
+        $consumidorFinal = Client::where('name', 'Consumidor Final')->first();
+
+        $this->assertNotNull($consumidorFinal);
+        $this->assertSame((string) $consumidorFinal->id, $component->get('client_id'));
+    }
+
+    public function test_consumidor_final_no_se_duplica_entre_facturas(): void
+    {
+        Livewire::actingAs($this->admin())->test('invoices.create');
+        Livewire::actingAs($this->admin())->test('invoices.create');
+
+        $this->assertSame(1, Client::where('name', 'Consumidor Final')->count());
+    }
+
+    public function test_buscar_cliente_y_seleccionarlo_reemplaza_al_select_de_toda_la_vida(): void
+    {
+        $client = Client::create(['name' => 'Distribuidora Norte', 'email' => 'dn@test.com', 'phone' => '3511234567']);
+
+        $component = Livewire::actingAs($this->admin())
+            ->test('invoices.create')
+            ->set('clientQuery', 'Distribuidora');
+
+        $this->assertCount(1, $component->get('clientResults'));
+
+        $component->call('selectClient', $client->id)
+            ->assertSet('client_id', (string) $client->id)
+            ->assertSet('clientQuery', '');
+    }
+
+    public function test_un_descuento_manual_mayor_a_100_no_se_puede_guardar(): void
+    {
+        // Bug real: sin este límite, un descuento de más de 100% dejaba el
+        // total de la factura en negativo.
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $product = Product::create(['name' => 'Notebook', 'price' => 1000, 'stock' => 10]);
+
+        Livewire::actingAs($this->admin())
+            ->test('invoices.create')
+            ->set('client_id', (string) $client->id)
+            ->call('addProductItem', $product->id)
+            ->set('items.0.discount', '150')
+            ->call('save')
+            ->assertHasErrors(['items.0.discount']);
+
+        $this->assertSame(0, Invoice::count());
+    }
+
+    public function test_puede_reemplazarse_consumidor_final_por_otro_cliente(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $product = Product::create(['name' => 'Notebook', 'price' => 1000, 'stock' => 10]);
+
+        Livewire::actingAs($this->admin())
+            ->test('invoices.create')
+            ->set('client_id', (string) $client->id)
+            ->call('addProductItem', $product->id)
+            ->call('save');
+
+        $invoice = Invoice::first();
+        $this->assertSame($client->id, $invoice->client_id);
+    }
+
+    public function test_can_create_invoice_with_product_item_and_split_payments(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $product = Product::create(['name' => 'Notebook', 'price' => 1000, 'stock' => 10]);
+        $admin = $this->admin();
+        CashSession::create(['user_id' => $admin->id, 'sucursal_id' => Sucursal::sole()->id, 'status' => 'open', 'opened_at' => now(), 'opening_amount' => 0]);
+
+        Livewire::actingAs($admin)
+            ->test('invoices.create')
+            ->set('client_id', (string) $client->id)
+            ->call('addProductItem', $product->id)
+            ->set('tax_rate', '21')
+            ->call('addPayment')
+            ->set('payments.0.method', 'efectivo')
+            ->set('payments.0.amount', '600')
+            ->call('addPayment')
+            ->call('save');
+
+        $invoice = Invoice::first();
+        $this->assertNotNull($invoice);
+        $this->assertEquals($client->id, $invoice->client_id);
+        $this->assertEquals(1, $invoice->items->count());
+        $this->assertEquals($product->id, $invoice->items->first()->product_id);
+        $this->assertEqualsWithDelta(1210.0, (float) $invoice->total, 0.01);
+    }
+
+    /**
+     * Bug real: "+ Agregar ítem sin producto" crea una línea con descripción
+     * vacía. Antes de este fix, esa línea contaba para total()/netoGravado()
+     * (lo que se ve en pantalla y lo que valida el límite de crédito/estado
+     * "paid"), pero se descartaba en save() por no tener descripción — la
+     * factura quedaba persistida con un total menor al que se mostró y
+     * validó.
+     */
+    public function test_item_sin_descripcion_no_cuenta_para_el_total_mostrado_ni_el_guardado(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $product = Product::create(['name' => 'Notebook', 'price' => 1000, 'stock' => 10, 'iva_rate' => 0]);
+
+        $invoices = Livewire::actingAs($this->admin())
+            ->test('invoices.create')
+            ->set('client_id', (string) $client->id)
+            ->call('addProductItem', $product->id) // ítem válido: $1000
+            ->call('addFreeformItem') // descripción vacía todavía
+            ->set('items.1.quantity', '5')
+            ->set('items.1.unit_price', '2000'); // cargó cantidad/precio pero no la descripción
+
+        $invoices->assertSee('1.000,00')->assertDontSee('11.000,00');
+
+        $invoices->call('save');
+
+        $invoice = Invoice::sole();
+        $this->assertEquals(1, $invoice->items->count());
+        $this->assertEqualsWithDelta(1000.0, (float) $invoice->total, 0.01);
+    }
+
+    /**
+     * MEJORA: a diferencia de Pos\Index (el carrito se vacía al vender) o de
+     * NotasCredito/FacturarRemito/Quotes (releen un registro existente), este
+     * formulario de alta no tenía ningún estado para detectar "esto ya se
+     * guardó" — el form sigue lleno después de guardar, así que dos submits
+     * casi simultáneos (doble clic) creaban dos facturas. Mismo patrón de
+     * test que RemitoFacturarTest: dos llamadas sobre la MISMA instancia.
+     */
+    public function test_doble_clic_en_guardar_no_duplica_la_factura(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $product = Product::create(['name' => 'Notebook', 'price' => 1000, 'stock' => 10]);
+
+        $component = Livewire::actingAs($this->admin())
+            ->test('invoices.create')
+            ->set('client_id', (string) $client->id)
+            ->call('addProductItem', $product->id);
+
+        $component->call('save')->assertHasNoErrors();
+        $component->call('save')->assertHasNoErrors(); // el flag corta antes de crear nada, no un error de validación
+
+        $this->assertSame(1, Invoice::count(), 'No debería duplicarse la factura al guardar dos veces la misma pantalla.');
+        $this->assertEquals(9, $product->fresh()->stock, 'El stock no debería descontarse dos veces.');
+    }
+
+    public function test_no_puede_registrar_un_pago_al_crear_factura_sin_caja_abierta(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $product = Product::create(['name' => 'Notebook', 'price' => 1000, 'stock' => 10]);
+
+        Livewire::actingAs($this->admin())
+            ->test('invoices.create')
+            ->set('client_id', (string) $client->id)
+            ->call('addProductItem', $product->id)
+            ->call('addPayment')
+            ->set('payments.0.method', 'efectivo')
+            ->set('payments.0.amount', '1000')
+            ->call('save')
+            ->assertHasErrors('payments');
+
+        $this->assertDatabaseCount('invoices', 0);
+        $this->assertEquals(10, $product->fresh()->stock);
+    }
+
+    public function test_no_se_puede_guardar_un_item_con_cantidad_negativa(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $product = Product::create(['name' => 'Notebook', 'price' => 1000, 'stock' => 10]);
+
+        Livewire::actingAs($this->admin())
+            ->test('invoices.create')
+            ->set('client_id', (string) $client->id)
+            ->call('addProductItem', $product->id)
+            ->set('items.0.quantity', '-5')
+            ->call('save')
+            ->assertHasErrors('items.0.quantity');
+
+        $this->assertSame(0, Invoice::count());
+        $this->assertSame(10, $product->fresh()->stock);
+    }
+
+    public function test_cannot_save_invoice_without_items(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+
+        Livewire::actingAs($this->admin())
+            ->test('invoices.create')
+            ->set('client_id', (string) $client->id)
+            ->call('save')
+            ->assertHasErrors(['items']);
+
+        $this->assertEquals(0, Invoice::count());
+    }
+
+    public function test_can_change_invoice_status_from_show_page(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $invoice = Invoice::create([
+            'number' => 'FAC-0001', 'client_id' => $client->id,
+            'issue_date' => now(), 'due_date' => now()->addDays(15), 'status' => 'draft',
+        ]);
+        $invoice->items()->create(['description' => 'Servicio', 'quantity' => 1, 'unit_price' => 500]);
+
+        Livewire::actingAs($this->admin())
+            ->test('invoices.show', ['invoice' => $invoice])
+            ->call('setStatus', 'paid');
+
+        $this->assertEquals('paid', $invoice->fresh()->status->value);
+    }
+
+    public function test_invoice_pdf_downloads(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $invoice = Invoice::create([
+            'number' => 'FAC-0001', 'client_id' => $client->id,
+            'issue_date' => now(), 'due_date' => now()->addDays(15), 'status' => 'draft',
+        ]);
+        $invoice->items()->create(['description' => 'Servicio', 'quantity' => 1, 'unit_price' => 500]);
+
+        $response = $this->actingAs($this->admin())->get(route('invoices.pdf', $invoice));
+
+        $response->assertOk();
+        $response->assertHeader('content-type', 'application/pdf');
+    }
+
+    public function test_invoice_pdf_usa_el_nombre_y_logo_de_la_empresa(): void
+    {
+        // El controller lee el logo con storage_path() (no con el disco de
+        // Storage), así que acá se escribe al disco 'public' real en vez de
+        // usar Storage::fake — de lo contrario ambos apuntarían a
+        // ubicaciones distintas y el test no probaría nada.
+        $logoPath = UploadedFile::fake()->image('logo.png')->store('company-logos', 'public');
+        CompanySettings::current()->update(['nombre_fantasia' => 'Mi Negocio', 'logo_path' => $logoPath]);
+
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $invoice = Invoice::create([
+            'number' => 'FAC-0010', 'client_id' => $client->id,
+            'issue_date' => now(), 'due_date' => now()->addDays(15), 'status' => 'draft',
+        ]);
+        $invoice->items()->create(['description' => 'Servicio', 'quantity' => 1, 'unit_price' => 500]);
+
+        try {
+            $response = $this->actingAs($this->admin())->get(route('invoices.pdf', $invoice));
+
+            $response->assertOk();
+        } finally {
+            Storage::disk('public')->delete($logoPath);
+        }
+    }
+
+    public function test_invoices_index_marca_las_ventas_de_tienda_online(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+
+        $local = Invoice::create([
+            'number' => 'FAC-7001', 'client_id' => $client->id, 'tax_rate' => 0,
+            'issue_date' => now(), 'due_date' => now(), 'status' => 'paid',
+        ]);
+
+        $pedido = TiendaPedido::create([
+            'token' => 'tok-index-1', 'sucursal_id' => Sucursal::sole()->id, 'status' => 'paid',
+            'customer_name' => 'Cliente online', 'customer_email' => 'online@test.com',
+            'cart_snapshot' => [], 'expires_at' => now()->addMinutes(30),
+        ]);
+        $online = Invoice::create([
+            'number' => 'FAC-7002', 'client_id' => $client->id, 'tax_rate' => 0,
+            'issue_date' => now(), 'due_date' => now(), 'status' => 'paid',
+            'tienda_pedido_id' => $pedido->id,
+        ]);
+
+        Livewire::actingAs($this->admin())->test('invoices.index')
+            ->assertSee('FAC-7001')
+            ->assertSee('FAC-7002')
+            ->assertSee('Online');
+
+        // Sin ninguna venta de tienda online en el listado, no debería
+        // aparecer ningún badge "Online" — confirma que no se muestra
+        // para cualquier factura, solo para las que vinieron de la tienda.
+        $online->delete();
+        Livewire::actingAs($this->admin())->test('invoices.index')
+            ->assertSee('FAC-7001')
+            ->assertDontSee('Online');
+    }
+
+    public function test_entregar_y_cobrar_factura_registra_pago_en_caja_y_marca_retirado(): void
+    {
+        $admin = $this->admin();
+        CashSession::create([
+            'user_id' => $admin->id, 'sucursal_id' => Sucursal::sole()->id,
+            'status' => 'open', 'opened_at' => now(), 'opening_amount' => 0,
+        ]);
+
+        $client = Client::create(['name' => 'Consumidor Final', 'email' => 'cf@test.com']);
+        $product = Product::create(['name' => 'Agua 500ml', 'price' => 900, 'stock' => 10]);
+
+        $pedido = TiendaPedido::create([
+            'token' => 'tok-entrega-1', 'sucursal_id' => Sucursal::sole()->id, 'status' => 'pending_payment',
+            'customer_name' => 'Rocío Fernández', 'customer_email' => 'rocio@example.com',
+            'cart_snapshot' => [], 'expires_at' => now()->addMinutes(30),
+        ]);
+        $remito = Invoice::create([
+            'number' => 'REM-8001', 'client_id' => $client->id, 'tax_rate' => 0,
+            'tipo_comprobante_interno' => 'remito_x',
+            'issue_date' => now(), 'due_date' => now(), 'status' => 'pending',
+            'tienda_pedido_id' => $pedido->id,
+        ]);
+        $remito->items()->create(['product_id' => $product->id, 'description' => 'Agua 500ml', 'quantity' => 2, 'unit_price' => 900, 'iva_rate' => 21]);
+
+        Livewire::actingAs($admin)->test('invoices.show', ['invoice' => $remito])
+            ->call('openEntregaModal')
+            ->set('entregaMetodoPago', 'efectivo')
+            ->call('entregarYCobrar')
+            ->assertRedirect();
+
+        $factura = $remito->fresh()->facturaGenerada();
+        $this->assertNotNull($factura);
+        $this->assertSame('paid', $factura->status->value);
+        $this->assertSame(1, $factura->payments()->count());
+        $this->assertSame('efectivo', $factura->payments->first()->method->value);
+        $this->assertSame(1, CashMovement::count());
+
+        $this->assertNotNull($pedido->fresh()->picked_up_at);
+        $this->assertSame('paid', $pedido->fresh()->status);
+    }
+
+    public function test_entregar_y_cobrar_eligiendo_remito_x_no_convierte_a_factura(): void
+    {
+        // No toda venta online necesita AFIP (ver feedback del usuario) — si
+        // el cajero elige Remito X, el remito mismo queda como comprobante
+        // final: pagado, retirado, sin generar ninguna factura nueva.
+        $admin = $this->admin();
+        CashSession::create([
+            'user_id' => $admin->id, 'sucursal_id' => Sucursal::sole()->id,
+            'status' => 'open', 'opened_at' => now(), 'opening_amount' => 0,
+        ]);
+
+        $client = Client::create(['name' => 'Consumidor Final', 'email' => 'cf@test.com']);
+        $product = Product::create(['name' => 'Agua 500ml', 'price' => 900, 'stock' => 10]);
+
+        $pedido = TiendaPedido::create([
+            'token' => 'tok-entrega-remito', 'sucursal_id' => Sucursal::sole()->id, 'status' => 'pending_payment',
+            'customer_name' => 'Rocío Fernández', 'customer_email' => 'rocio@example.com',
+            'cart_snapshot' => [], 'expires_at' => now()->addMinutes(30),
+        ]);
+        $remito = Invoice::create([
+            'number' => 'REM-8003', 'client_id' => $client->id, 'tax_rate' => 0,
+            'tipo_comprobante_interno' => 'remito_x',
+            'issue_date' => now(), 'due_date' => now(), 'status' => 'pending',
+            'tienda_pedido_id' => $pedido->id,
+        ]);
+        $remito->items()->create(['product_id' => $product->id, 'description' => 'Agua 500ml', 'quantity' => 2, 'unit_price' => 900, 'iva_rate' => 21]);
+
+        Livewire::actingAs($admin)->test('invoices.show', ['invoice' => $remito])
+            ->call('openEntregaModal')
+            ->set('entregaTipoComprobante', 'remito_x')
+            ->set('entregaMetodoPago', 'tarjeta')
+            ->call('entregarYCobrar')
+            ->assertRedirect(route('invoices.show', $remito));
+
+        $remito->refresh();
+        $this->assertNull($remito->facturaGenerada());
+        $this->assertSame('paid', $remito->status->value);
+        $this->assertSame(1, $remito->payments()->count());
+        $this->assertSame('tarjeta', $remito->payments->first()->method->value);
+        $this->assertSame(1, CashMovement::count());
+
+        $this->assertNotNull($pedido->fresh()->picked_up_at);
+        $this->assertSame('paid', $pedido->fresh()->status);
+
+        // Al quedar pagado sin generar factura, el remito mismo pasa a
+        // aparecer en Facturas (ver Index.php) — ya no es "pendiente".
+        Livewire::actingAs($admin)->test('invoices.index')
+            ->assertSee('REM-8003');
+    }
+
+    public function test_entregar_y_cobrar_exige_caja_abierta(): void
+    {
+        $client = Client::create(['name' => 'Consumidor Final', 'email' => 'cf@test.com']);
+        $pedido = TiendaPedido::create([
+            'token' => 'tok-entrega-2', 'sucursal_id' => Sucursal::sole()->id, 'status' => 'pending_payment',
+            'customer_name' => 'Rocío Fernández', 'customer_email' => 'rocio@example.com',
+            'cart_snapshot' => [], 'expires_at' => now()->addMinutes(30),
+        ]);
+        $remito = Invoice::create([
+            'number' => 'REM-8002', 'client_id' => $client->id, 'tax_rate' => 0,
+            'tipo_comprobante_interno' => 'remito_x',
+            'issue_date' => now(), 'due_date' => now(), 'status' => 'pending',
+            'tienda_pedido_id' => $pedido->id,
+        ]);
+        $remito->items()->create(['description' => 'Item', 'quantity' => 1, 'unit_price' => 900, 'iva_rate' => 21]);
+
+        Livewire::actingAs($this->admin())->test('invoices.show', ['invoice' => $remito])
+            ->call('openEntregaModal')
+            ->call('entregarYCobrar')
+            ->assertSet('entregaError', 'Tenés que abrir la caja antes de cobrar.');
+
+        $this->assertNull($remito->fresh()->facturaGenerada());
+        $this->assertNull($pedido->fresh()->picked_up_at);
+    }
+
+    public function test_marcar_y_desmarcar_retirado_en_una_venta_de_tienda_online(): void
+    {
+        $client = Client::create(['name' => 'Consumidor Final', 'email' => 'cf@test.com']);
+        $pedido = TiendaPedido::create([
+            'token' => 'tok-retiro-1', 'sucursal_id' => Sucursal::sole()->id, 'status' => 'paid',
+            'customer_name' => 'Rocío Fernández', 'customer_email' => 'rocio@example.com',
+            'cart_snapshot' => [], 'expires_at' => now()->addMinutes(30),
+        ]);
+        $invoice = Invoice::create([
+            'number' => 'FAC-7004', 'client_id' => $client->id, 'tax_rate' => 0,
+            'issue_date' => now(), 'due_date' => now(), 'status' => 'paid',
+            'tienda_pedido_id' => $pedido->id,
+        ]);
+
+        $component = Livewire::actingAs($this->admin())->test('invoices.show', ['invoice' => $invoice])
+            ->assertSee('Pendiente de retiro');
+
+        $component->call('toggleRetirado');
+        $this->assertNotNull($pedido->fresh()->picked_up_at);
+        $component->assertSee('Retirado el');
+
+        $component->call('toggleRetirado');
+        $this->assertNull($pedido->fresh()->picked_up_at);
+        $component->assertSee('Pendiente de retiro');
+    }
+
+    public function test_toggle_retirado_rechaza_una_factura_que_no_es_de_tienda_online(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        $invoice = Invoice::create([
+            'number' => 'FAC-7005', 'client_id' => $client->id, 'tax_rate' => 0,
+            'issue_date' => now(), 'due_date' => now(), 'status' => 'paid',
+        ]);
+
+        Livewire::actingAs($this->admin())->test('invoices.show', ['invoice' => $invoice])
+            ->call('toggleRetirado')
+            ->assertStatus(404);
+    }
+
+    public function test_invoices_index_muestra_el_medio_de_pago(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+
+        $pagada = Invoice::create([
+            'number' => 'FAC-7010', 'client_id' => $client->id, 'tax_rate' => 0,
+            'issue_date' => now(), 'due_date' => now(), 'status' => 'paid',
+        ]);
+        $pagada->payments()->create(['method' => 'efectivo', 'amount' => 1000]);
+
+        $sinPago = Invoice::create([
+            'number' => 'FAC-7011', 'client_id' => $client->id, 'tax_rate' => 0,
+            'issue_date' => now(), 'due_date' => now(), 'status' => 'pending',
+        ]);
+
+        Livewire::actingAs($this->admin())->test('invoices.index')
+            ->assertSee('FAC-7010')
+            ->assertSee('Efectivo')
+            ->assertSee('FAC-7011');
+    }
+
+    public function test_invoices_index_y_show_muestran_el_comprador_real_de_tienda_online(): void
+    {
+        // El checkout de la tienda siempre factura a Consumidor Final (ver
+        // Tienda\Checkout::confirmar()) — sin esto, el listado y el detalle
+        // mostraban "Consumidor Final" en vez del comprador real, que sí se
+        // pidió en el checkout y queda guardado en TiendaPedido.
+        $consumidorFinal = Client::create(['name' => 'Consumidor Final', 'email' => 'cf@test.com']);
+
+        $pedido = TiendaPedido::create([
+            'token' => 'tok-buyer-1', 'sucursal_id' => Sucursal::sole()->id, 'status' => 'paid',
+            'customer_name' => 'Rocío Fernández', 'customer_email' => 'rocio@example.com', 'customer_phone' => '2984000000',
+            'cart_snapshot' => [], 'expires_at' => now()->addMinutes(30),
+        ]);
+        $invoice = Invoice::create([
+            'number' => 'FAC-7003', 'client_id' => $consumidorFinal->id, 'tax_rate' => 0,
+            'issue_date' => now(), 'due_date' => now(), 'status' => 'paid',
+            'tienda_pedido_id' => $pedido->id,
+        ]);
+
+        Livewire::actingAs($this->admin())->test('invoices.index')
+            ->assertSee('Rocío Fernández')
+            ->assertDontSee('Consumidor Final');
+
+        Livewire::actingAs($this->admin())->test('invoices.show', ['invoice' => $invoice])
+            ->assertSee('Rocío Fernández')
+            ->assertSee('rocio@example.com')
+            ->assertSee('2984000000')
+            // El nombre fiscal sigue ahí (ver Facturado a), solo se agrega
+            // el comprador real al lado, no se reemplaza el dato fiscal.
+            ->assertSee('Consumidor Final');
+    }
+
+    public function test_invoices_index_paginates_instead_of_loading_everything(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+        for ($i = 1; $i <= 21; $i++) {
+            $invoice = Invoice::create([
+                'number' => 'FAC-'.str_pad((string) $i, 4, '0', STR_PAD_LEFT), 'client_id' => $client->id,
+                'issue_date' => now(), 'due_date' => now()->addDays(15), 'status' => 'draft',
+            ]);
+            $invoice->items()->create(['description' => 'x', 'quantity' => 1, 'unit_price' => 100]);
+        }
+
+        $component = Livewire::actingAs($this->admin())->test('invoices.index');
+
+        $this->assertCount(20, $component->viewData('invoices'));
+        $this->assertEquals(2, $component->viewData('invoices')->lastPage());
+    }
+
+    public function test_invoices_index_filtra_vencidas_a_nivel_de_query(): void
+    {
+        $client = Client::create(['name' => 'Cliente 1', 'email' => 'c1@test.com']);
+
+        $overdue = Invoice::create([
+            'number' => 'FAC-0001', 'client_id' => $client->id,
+            'issue_date' => now()->subDays(20), 'due_date' => now()->subDays(5), 'status' => 'pending',
+        ]);
+        $pending = Invoice::create([
+            'number' => 'FAC-0002', 'client_id' => $client->id,
+            'issue_date' => now(), 'due_date' => now()->addDays(15), 'status' => 'pending',
+        ]);
+        foreach ([$overdue, $pending] as $invoice) {
+            $invoice->items()->create(['description' => 'x', 'quantity' => 1, 'unit_price' => 100]);
+        }
+
+        Livewire::actingAs($this->admin())
+            ->test('invoices.index')
+            ->set('filter', 'overdue')
+            ->assertSee('FAC-0001')
+            ->assertDontSee('FAC-0002')
+            ->set('filter', 'pending')
+            ->assertSee('FAC-0002')
+            ->assertDontSee('FAC-0001');
+    }
+}

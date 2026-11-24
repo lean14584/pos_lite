@@ -1,0 +1,161 @@
+<?php
+
+namespace App\Models;
+
+use App\Concerns\Auditable;
+use App\Enums\CondicionIva;
+use App\Enums\PaymentMethod;
+use App\Enums\TipoComprobanteInterno;
+use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+#[Fillable(['cuit', 'razon_social', 'nombre_fantasia', 'domicilio', 'logo_path', 'condicion_iva', 'factura_a_habilitada', 'factura_b_habilitada', 'factura_c_habilitada', 'tiendanube_store_id', 'tiendanube_token', 'tiendanube_webhook_secret', 'tiendanube_sucursal_id', 'barcode_scale_enabled', 'barcode_scale_prefix', 'barcode_scale_code_digits', 'barcode_scale_weight_digits', 'descuento_efectivo_pct', 'descuento_transferencia_pct', 'theme_primary_color', 'theme_secondary_color', 'tienda_online_habilitada', 'tienda_online_sucursal_id', 'tienda_online_reserva_minutos'])]
+class CompanySettings extends Model
+{
+    use Auditable;
+
+    // Igual que SucursalMercadoPagoConfig con access_token: son secretos,
+    // no algo para dejar en texto plano en audit_logs (visible además para
+    // el rol Encargado, no solo Admin).
+    protected array $auditExclude = ['tiendanube_token', 'tiendanube_webhook_secret'];
+
+    public function tiendanubeSucursal(): BelongsTo
+    {
+        return $this->belongsTo(Sucursal::class, 'tiendanube_sucursal_id');
+    }
+
+    public function tiendaOnlineSucursal(): BelongsTo
+    {
+        return $this->belongsTo(Sucursal::class, 'tienda_online_sucursal_id');
+    }
+
+    protected function casts(): array
+    {
+        return [
+            'condicion_iva' => CondicionIva::class,
+            'factura_a_habilitada' => 'boolean',
+            'factura_b_habilitada' => 'boolean',
+            'factura_c_habilitada' => 'boolean',
+            'barcode_scale_enabled' => 'boolean',
+            'barcode_scale_code_digits' => 'integer',
+            'barcode_scale_weight_digits' => 'integer',
+            'descuento_efectivo_pct' => 'decimal:2',
+            'descuento_transferencia_pct' => 'decimal:2',
+            'tienda_online_habilitada' => 'boolean',
+            'tienda_online_reserva_minutos' => 'integer',
+        ];
+    }
+
+    /**
+     * Sucursal cuyo stock/precio ve el storefront público. Nullable en DB:
+     * si el admin todavía no eligió ninguna, cae a la primera sucursal —
+     * mismo criterio de red de seguridad que CurrentSucursal/TiendanubeSync.
+     */
+    public function tiendaOnlineSucursalId(): ?int
+    {
+        return $this->tienda_online_sucursal_id ?? Sucursal::orderBy('id')->value('id');
+    }
+
+    /**
+     * % de descuento por pago de contado según el medio elegido. Tarjeta y el
+     * resto de los medios cobran el precio de lista (0%, equivale a "crédito").
+     */
+    public function descuentoPctParaMedioDePago(PaymentMethod $method): float
+    {
+        return match ($method) {
+            PaymentMethod::Efectivo => (float) $this->descuento_efectivo_pct,
+            PaymentMethod::Transferencia => (float) $this->descuento_transferencia_pct,
+            default => 0.0,
+        };
+    }
+
+    /**
+     * Tipos de comprobante elegibles en el formulario de factura, ya
+     * filtrados por lo que la empresa tiene habilitado. Remito X y Devolución
+     * son internos (siempre disponibles); Factura A/B dependen de los toggles.
+     *
+     * @return array<int, TipoComprobanteInterno>
+     */
+    public function tiposComprobanteSeleccionables(): array
+    {
+        return array_values(array_filter(
+            TipoComprobanteInterno::seleccionablesEnFactura(),
+            fn (TipoComprobanteInterno $t) => match ($t) {
+                TipoComprobanteInterno::FacturaA => $this->factura_a_habilitada,
+                TipoComprobanteInterno::FacturaB => $this->factura_b_habilitada,
+                TipoComprobanteInterno::FacturaC => $this->factura_c_habilitada,
+                default => true,
+            }
+        ));
+    }
+
+    /**
+     * Tipo de comprobante por defecto para una factura nueva: prioriza B,
+     * después A, después C, y si no hay ninguna fiscal habilitada cae a
+     * Remito X. Un cliente que tiene apagada la facturación fiscal manual
+     * (ver config('features.invoices_manual_create')) arranca siempre en
+     * Remito X aunque Factura A/B/C sigan tildadas en esta configuración —
+     * esos toggles quedan para cuando en algún momento se habilite
+     * facturar de verdad.
+     */
+    public function tipoComprobantePorDefecto(): TipoComprobanteInterno
+    {
+        if (! config('features.invoices_manual_create')) {
+            return TipoComprobanteInterno::RemitoX;
+        }
+
+        return match (true) {
+            $this->factura_b_habilitada => TipoComprobanteInterno::FacturaB,
+            $this->factura_a_habilitada => TipoComprobanteInterno::FacturaA,
+            $this->factura_c_habilitada => TipoComprobanteInterno::FacturaC,
+            default => TipoComprobanteInterno::RemitoX,
+        };
+    }
+
+    /**
+     * Un Monotributista o Exento no discrimina IVA en sus comprobantes
+     * (Factura C): el selector de alícuota por ítem no debería ni
+     * ofrecerse, para que no quede cargado un IVA que después haya que
+     * anular a mano al emitir (ver InvoiceCaeEmitter::emit()).
+     */
+    public function debeOcultarIvaPorItem(): bool
+    {
+        return in_array($this->condicion_iva, [CondicionIva::Monotributista, CondicionIva::Exento], true);
+    }
+
+    /**
+     * Nombre a mostrar en PDFs y demás lugares de cara al cliente: prioriza
+     * el nombre de fantasía sobre la razón social, y cae al nombre de la
+     * app si todavía no se cargaron los datos de la empresa.
+     */
+    protected function displayName(): Attribute
+    {
+        return Attribute::get(fn () => $this->nombre_fantasia ?: ($this->razon_social ?: config('app.name')));
+    }
+
+    /**
+     * Fila única de configuración de la empresa (sembrada por la migración
+     * con id=1), para no repetir firstOrCreate en cada lugar que la usa.
+     *
+     * MEJORA intentada y descartada (dos veces): memoizar ahorraría varias
+     * consultas idénticas por acción (se llama decenas de veces en todo el
+     * sistema). El primer intento con once() rompía flujos que actualizan y
+     * releen esta fila dentro del mismo proceso (7 tests). Un segundo intento
+     * usando una propiedad estática invalidada por el evento `saved` (más
+     * reseteada en booted(), para cubrir el reseteo de booted-state entre
+     * tests) TAMPOCO alcanzó: filtró valores de un test a otro de todos
+     * modos (booted() no se dispara de forma confiable en el límite exacto
+     * de cada test), causando montos de descuento equivocados en Invoices/
+     * Pos/PromotionGroup — un bug de plata real, no cosmético. Ninguna
+     * variante de caché en memoria de proceso es segura acá sin una
+     * inversión bastante más grande (ej. cache real invalidado por evento Y
+     * verificado contra Octane/tests a fondo). No vale el riesgo para el
+     * ahorro que da.
+     */
+    public static function current(): self
+    {
+        return static::query()->findOrFail(1);
+    }
+}

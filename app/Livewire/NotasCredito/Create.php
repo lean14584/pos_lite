@@ -1,0 +1,287 @@
+<?php
+
+namespace App\Livewire\NotasCredito;
+
+use App\Enums\AlicuotaIva;
+use App\Enums\PaymentMethod;
+use App\Enums\TipoComprobante;
+use App\Enums\TipoComprobanteInterno;
+use App\Livewire\Concerns\CalculatesInvoiceTotals;
+use App\Models\Invoice;
+use App\Support\CashLinker;
+use App\Support\CurrentSucursal;
+use App\Support\InvoiceNumberGenerator;
+use App\Support\StockAdjuster;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+use RuntimeException;
+
+#[Layout('layouts.app')]
+class Create extends Component
+{
+    use CalculatesInvoiceTotals;
+
+    public Invoice $invoice;
+
+    public bool $afecta_stock = true;
+
+    /** @var array<int, array{product_id: ?int, description: string, quantity: string, unit_price: string}> */
+    public array $items = [];
+
+    /** @var array<int, array{method: string, amount: string}> */
+    public array $payments = [];
+
+    public function mount(Invoice $invoice): void
+    {
+        abort_unless(
+            Auth::user()?->esAdminGlobal() || $invoice->sucursal_id === CurrentSucursal::id(),
+            403,
+            'No podés emitir una Nota de Crédito para una factura de otra sucursal.'
+        );
+
+        abort_if(! $invoice->isFiscal, 403, 'Solo se puede emitir una Nota de Crédito para una factura con CAE.');
+        abort_if($invoice->related_invoice_id !== null, 403, 'Una Nota de Crédito no puede tener, a su vez, otra Nota de Crédito.');
+
+        $this->invoice = $invoice;
+
+        $this->items = $invoice->items->map(fn ($item) => [
+            'invoice_item_id' => $item->id,
+            'product_id' => $item->product_id,
+            'description' => $item->description,
+            'quantity' => (string) $item->quantity,
+            'quantity_original' => (string) $item->quantity,
+            'unit_price' => (string) $item->unit_price,
+            'unit_price_original' => (string) $item->unit_price,
+            'iva_rate' => AlicuotaIva::normalizar($item->iva_rate_efectiva),
+        ])->all();
+    }
+
+    public function removeItem(int $index): void
+    {
+        unset($this->items[$index]);
+        $this->items = array_values($this->items);
+    }
+
+    public function paidTotal(): float
+    {
+        return collect($this->payments)->sum(fn ($p) => (float) $p['amount']);
+    }
+
+    public function remaining(): float
+    {
+        return max(0, round($this->total() - $this->paidTotal(), 2));
+    }
+
+    public function addPayment(): void
+    {
+        $this->payments[] = [
+            'method' => 'efectivo',
+            'amount' => (string) $this->remaining(),
+        ];
+    }
+
+    public function removePayment(int $index): void
+    {
+        unset($this->payments[$index]);
+        $this->payments = array_values($this->payments);
+    }
+
+    /**
+     * `wire:model.live` en el mismo renglón que el botón de "quitar" puede
+     * dejar una entrada a medio construir tras un borrado + reindexado por
+     * `array_values()` — mismo mecanismo que rompió `Products\Labels` en
+     * producción. Se descarta cualquier entrada incompleta en vez de
+     * arriesgar una Nota de Crédito con un ítem o pago a medio llenar.
+     */
+    public function updated(string $name): void
+    {
+        if (str_starts_with($name, 'items.')) {
+            $this->items = array_values(array_filter(
+                $this->items,
+                fn (array $i) => isset($i['description'], $i['quantity'], $i['unit_price'], $i['iva_rate'])
+            ));
+        }
+
+        if (str_starts_with($name, 'payments.')) {
+            $this->payments = array_values(array_filter(
+                $this->payments,
+                fn (array $p) => isset($p['method'], $p['amount'])
+            ));
+        }
+    }
+
+    /**
+     * $items es una property pública de Livewire: quantity_original y
+     * unit_price_original (la base del tope de abajo) llegan en cada request
+     * tal como las mande el cliente, sin garantía de que sigan siendo lo que
+     * mount() puso ahí. Se resincronizan acá contra el InvoiceItem real por
+     * su invoice_item_id antes de validar nada — product_id/description/
+     * quantity_original/unit_price_original/iva_rate siempre salen de la
+     * base. quantity y unit_price (lo que efectivamente se acredita, topeado
+     * más abajo contra esos *_original ya confiables) quedan tal como los
+     * cargó el usuario.
+     */
+    private function sincronizarConFacturaOriginal(): void
+    {
+        foreach ($this->items as $i => $item) {
+            $original = $this->invoice->items->firstWhere('id', (int) ($item['invoice_item_id'] ?? 0));
+
+            if (! $original) {
+                unset($this->items[$i]);
+
+                continue;
+            }
+
+            $this->items[$i]['product_id'] = $original->product_id;
+            $this->items[$i]['description'] = $original->description;
+            $this->items[$i]['quantity_original'] = (string) $original->quantity;
+            $this->items[$i]['unit_price_original'] = (string) $original->unit_price;
+            $this->items[$i]['iva_rate'] = AlicuotaIva::normalizar($original->iva_rate_efectiva);
+        }
+
+        $this->items = array_values($this->items);
+    }
+
+    public function save(): void
+    {
+        $this->sincronizarConFacturaOriginal();
+
+        $validItems = $this->validItems();
+
+        if ($validItems->isEmpty()) {
+            $this->addError('items', 'Agregá al menos un ítem con descripción.');
+
+            return;
+        }
+
+        // Antes solo se comparaba con (float) cast: un valor no numérico
+        // colapsaba en silencio a 0 en vez de disparar un error, más débil
+        // que Invoices\Create/Edit y Purchases\Create/Edit para el mismo
+        // tipo de operación (acá también mueve stock y plata).
+        $this->validate([
+            'items.*.quantity' => ['required', 'numeric', 'min:0.01'],
+            'items.*.unit_price' => ['required', 'numeric', 'min:0'],
+        ]);
+
+        // Los inputs solo tienen min="0" en el HTML — sin este chequeo, se
+        // podía subir la cantidad o el precio de una línea por encima de lo
+        // que decía la factura original (ej. acreditar 20 unidades de un
+        // producto habiendo vendido 10) mientras se borraba otra línea para
+        // que el total en pesos siguiera dentro de lo disponible: la NC
+        // quedaba "cuadrada" en plata pero el stock repuesto no coincidía
+        // con lo realmente devuelto.
+        $excedeElOriginal = $validItems->contains(
+            fn ($item) => (float) $item['quantity'] > (float) $item['quantity_original']
+                || (float) $item['unit_price'] > (float) $item['unit_price_original']
+        );
+
+        if ($excedeElOriginal) {
+            $this->addError('items', 'La cantidad o el precio de algún ítem supera lo facturado originalmente.');
+
+            return;
+        }
+
+        // El reintegro tiene que quedar anotado en la caja de la sucursal de
+        // la factura ORIGINAL — si no hay una abierta, la plata que sale
+        // queda invisible para el arqueo (CashLinker::linkX() no avisa).
+        $tieneReintegro = collect($this->payments)->contains(fn ($p) => (float) $p['amount'] > 0);
+
+        if ($tieneReintegro && ! CashLinker::hasOpenSession($this->invoice->sucursal_id)) {
+            $this->addError('payments', 'Tenés que abrir la caja de esa sucursal antes de registrar el reintegro.');
+
+            return;
+        }
+
+        $tipoNC = match ($this->invoice->tipo_comprobante) {
+            TipoComprobante::FacturaA => TipoComprobanteInterno::NotaCreditoA,
+            TipoComprobante::FacturaC => TipoComprobanteInterno::NotaCreditoC,
+            default => TipoComprobanteInterno::NotaCreditoB,
+        };
+
+        // El chequeo de "cuánto queda por acreditar" y la creación de la NC
+        // (que mueve stock y caja ya en borrador, antes de emitir a AFIP)
+        // tienen que ser una sola unidad atómica por factura: si no,
+        // dos submits casi simultáneos (doble clic, o dos personas) contra
+        // la misma factura pueden pasar el chequeo los dos y duplicar la
+        // reversión de stock/plata. Se relee la factura ya adentro del lock.
+        try {
+            $notaCredito = Cache::lock("nota-credito:factura:{$this->invoice->id}", 10)->block(5, function () use ($validItems, $tipoNC) {
+                $invoice = $this->invoice->fresh();
+
+                $disponible = round((float) $invoice->total - (float) $invoice->creditedTotal, 2);
+
+                if (round($this->total(), 2) > $disponible + 0.009) {
+                    throw new RuntimeException(
+                        'El total a acreditar ($'.money($this->total())
+                            .') supera el saldo pendiente de acreditar de la factura ($'.money(max($disponible, 0)).').'
+                    );
+                }
+
+                // Punto de venta, stock y caja de la NC son los de la
+                // FACTURA ORIGINAL (mismo punto de venta, no solo misma
+                // sucursal — puede tener varios), no la sesión activa de
+                // quien procesa la devolución ahora (puede ser un admin
+                // parado en otra sucursal, o haber pasado tiempo). Fallback
+                // al por defecto de la sucursal solo para facturas viejas
+                // creadas antes de que existiera esta columna.
+                $puntoVentaNumero = $invoice->punto_venta
+                    ?? $invoice->sucursal?->puntoVentaPorDefecto()?->numero
+                    ?? 1;
+
+                return InvoiceNumberGenerator::withLock($tipoNC->value, fn () => DB::transaction(function () use ($validItems, $tipoNC, $invoice, $puntoVentaNumero) {
+                    $nota = Invoice::create([
+                        'number' => InvoiceNumberGenerator::next($tipoNC->value, null, $puntoVentaNumero),
+                        'client_id' => $invoice->client_id,
+                        'sucursal_id' => $invoice->sucursal_id,
+                        'punto_venta' => $puntoVentaNumero,
+                        'related_invoice_id' => $invoice->id,
+                        'tipo_comprobante_interno' => $tipoNC,
+                        'afecta_stock' => $this->afecta_stock,
+                        'issue_date' => now()->toDateString(),
+                        'due_date' => now()->toDateString(),
+                        'tax_rate' => 0,
+                        'status' => 'draft',
+                    ]);
+
+                    foreach ($validItems as $item) {
+                        $nota->items()->create([
+                            'product_id' => $item['product_id'],
+                            'description' => $item['description'],
+                            'quantity' => $item['quantity'],
+                            'unit_price' => $item['unit_price'],
+                            'iva_rate' => $item['iva_rate'] ?? '21',
+                        ]);
+                    }
+
+                    StockAdjuster::apply($validItems, $this->afecta_stock ? $tipoNC->stockSign() : 0, $invoice->sucursal_id);
+
+                    foreach ($this->payments as $payment) {
+                        if ((float) $payment['amount'] > 0) {
+                            $created = $nota->payments()->create($payment);
+                            CashLinker::linkInvoiceRefund($nota, $created, $invoice->sucursal_id);
+                        }
+                    }
+
+                    return $nota;
+                }), null, $puntoVentaNumero);
+            });
+        } catch (RuntimeException $e) {
+            $this->addError('items', $e->getMessage());
+
+            return;
+        }
+
+        session()->flash('status', 'Nota de crédito generada.');
+        $this->redirect(route('invoices.show', $notaCredito), navigate: true);
+    }
+
+    public function render()
+    {
+        return view('livewire.notas-credito.create', [
+            'paymentMethods' => PaymentMethod::cases(),
+        ]);
+    }
+}

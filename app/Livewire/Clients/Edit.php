@@ -1,0 +1,83 @@
+<?php
+
+namespace App\Livewire\Clients;
+
+use App\Enums\CondicionIva;
+use App\Enums\TipoDocumento;
+use App\Models\Client;
+use App\Models\PriceList;
+use Illuminate\Validation\Rule;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
+
+#[Layout('layouts.app')]
+class Edit extends Component
+{
+    public Client $client;
+
+    public string $name = '';
+
+    public string $email = '';
+
+    public string $phone = '';
+
+    public string $address = '';
+
+    public string $tax_id = '';
+
+    public string $condicion_iva = 'consumidor_final';
+
+    public string $tipo_documento = 'sin_identificar';
+
+    public ?int $price_list_id = null;
+
+    public string $credit_limit = '';
+
+    public function mount(Client $client): void
+    {
+        $this->client = $client;
+        $this->name = $client->name;
+        $this->email = (string) $client->email;
+        $this->phone = (string) $client->phone;
+        $this->address = (string) $client->address;
+        $this->tax_id = (string) $client->tax_id;
+        $this->condicion_iva = $client->condicion_iva->value;
+        $this->tipo_documento = $client->tipo_documento->value;
+        $this->price_list_id = $client->price_list_id;
+        $this->credit_limit = $client->credit_limit !== null ? (string) $client->credit_limit : '';
+    }
+
+    public function save(): void
+    {
+        $phoneRequired = config('features.client_phone_required');
+
+        $data = $this->validate([
+            'name' => ['required', 'string', 'max:255'],
+            'email' => $phoneRequired ? ['nullable', 'email', 'max:255'] : ['required', 'email', 'max:255'],
+            'phone' => $phoneRequired ? ['required', 'string', 'max:255'] : ['nullable', 'string', 'max:255'],
+            'address' => ['nullable', 'string', 'max:255'],
+            'tax_id' => ['nullable', 'string', 'max:255'],
+            'condicion_iva' => ['required', Rule::enum(CondicionIva::class)],
+            'tipo_documento' => ['required', Rule::enum(TipoDocumento::class)],
+            'price_list_id' => ['nullable', 'exists:price_lists,id'],
+            'credit_limit' => ['nullable', 'numeric', 'min:0'],
+        ]);
+
+        $data['credit_limit'] = $this->credit_limit === '' ? null : $this->credit_limit;
+
+        $this->client->update($data);
+
+        session()->flash('status', 'Cliente actualizado.');
+        $this->redirect(route('clients.index'), navigate: true);
+    }
+
+    public function render()
+    {
+        return view('livewire.clients.edit', [
+            'condicionIvaOptions' => CondicionIva::cases(),
+            'tipoDocumentoOptions' => TipoDocumento::cases(),
+            'priceLists' => PriceList::activasParaSelectCached(),
+            'phoneRequired' => config('features.client_phone_required'),
+        ]);
+    }
+}

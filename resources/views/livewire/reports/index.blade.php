@@ -1,0 +1,258 @@
+@php
+    $barPct = fn ($value, $max) => $max > 0 ? max(2, round(($value / $max) * 100)) : 0;
+@endphp
+
+<div class="p-8 max-w-6xl mx-auto">
+    <x-page-header title="Informes de ventas" subtitle="Facturas no borrador, agrupadas por distintos criterios" icon="chart-bar">
+        <x-slot:actions>
+            <a href="{{ route('reports.export.pdf', ['fromDate' => $fromDate, 'toDate' => $toDate, 'sucursal_id' => $sucursal_id]) }}" class="inline-flex items-center gap-1.5 rounded-lg bg-white/15 border border-white/25 px-3 py-2 text-sm font-medium text-white hover:bg-white/25 transition-all">
+                <x-heroicon-o-document-arrow-down class="w-4 h-4" /> PDF
+            </a>
+            <a href="{{ route('reports.export.csv', ['fromDate' => $fromDate, 'toDate' => $toDate, 'sucursal_id' => $sucursal_id]) }}" class="inline-flex items-center gap-1.5 rounded-lg bg-white/15 border border-white/25 px-3 py-2 text-sm font-medium text-white hover:bg-white/25 transition-all">
+                <x-heroicon-o-table-cells class="w-4 h-4" /> Excel
+            </a>
+        </x-slot:actions>
+    </x-page-header>
+
+    <div class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-4 mb-6 flex flex-col sm:flex-row sm:items-end gap-3">
+        <div>
+            <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Desde</label>
+            <input type="date" wire:model.live="fromDate" class="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/60 dark:text-gray-100 px-3 py-2.5 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-400 focus:border-sky-400 transition">
+        </div>
+        <div>
+            <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Hasta</label>
+            <input type="date" wire:model.live="toDate" class="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/60 dark:text-gray-100 px-3 py-2.5 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-400 focus:border-sky-400 transition">
+        </div>
+        @if ($puedeVerTodasLasSucursales)
+            <div>
+                <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Sucursal</label>
+                <select wire:model.live="sucursal_id" class="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/60 dark:text-gray-100 px-3 py-2.5 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-400 focus:border-sky-400 transition">
+                    <option value="">Todas (consolidado)</option>
+                    @foreach ($sucursales as $s)
+                        <option value="{{ $s->id }}">{{ $s->name }}</option>
+                    @endforeach
+                </select>
+            </div>
+        @endif
+        <div class="flex gap-6 sm:ml-auto text-sm">
+            <div>
+                <p class="text-xs text-gray-400 dark:text-gray-500 uppercase">Total vendido</p>
+                <p class="font-semibold text-gray-900 dark:text-gray-100 flex items-center gap-1.5">
+                    ${{ money($summary['total']) }}
+                    @if ($variationPct === null)
+                        <span class="text-xs font-normal text-gray-400 dark:text-gray-500">—</span>
+                    @else
+                        <span class="text-xs font-normal inline-flex items-center gap-0.5 {{ $variationPct >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400' }}" title="vs. período anterior">
+                            @if ($variationPct >= 0)
+                                <x-heroicon-o-arrow-trending-up class="w-3.5 h-3.5" />
+                            @else
+                                <x-heroicon-o-arrow-trending-down class="w-3.5 h-3.5" />
+                            @endif
+                            {{ number_format(abs($variationPct), 1) }}%
+                        </span>
+                    @endif
+                </p>
+            </div>
+            <div>
+                <p class="text-xs text-gray-400 dark:text-gray-500 uppercase">Facturas</p>
+                <p class="font-semibold text-gray-900 dark:text-gray-100">{{ $summary['count'] }}</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-4 mb-6">
+        <label class="flex items-center gap-2 cursor-pointer w-fit">
+            <input type="checkbox" wire:model.live="compare" class="w-4 h-4 rounded border-gray-300 dark:border-gray-600 text-sky-600 focus:ring-sky-500">
+            <span class="text-sm font-medium text-gray-700 dark:text-gray-300">Comparar contra otro período</span>
+        </label>
+
+        @if ($compare)
+            <div class="flex flex-col sm:flex-row sm:items-end gap-3 mt-3">
+                <div>
+                    <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Desde (período B)</label>
+                    <input type="date" wire:model.live="fromDateB" class="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/60 dark:text-gray-100 px-3 py-2.5 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-400 focus:border-sky-400 transition">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Hasta (período B)</label>
+                    <input type="date" wire:model.live="toDateB" class="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/60 dark:text-gray-100 px-3 py-2.5 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-400 focus:border-sky-400 transition">
+                </div>
+            </div>
+
+            @php
+                $diffTotal = $comparisonB['summary']['total'] > 0 ? (($summary['total'] - $comparisonB['summary']['total']) / $comparisonB['summary']['total']) * 100 : null;
+                $diffCount = $comparisonB['summary']['count'] > 0 ? (($summary['count'] - $comparisonB['summary']['count']) / $comparisonB['summary']['count']) * 100 : null;
+                $pillClass = fn ($pct) => $pct === null ? 'text-gray-400 dark:text-gray-500' : ($pct >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400');
+            @endphp
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-4">
+                <div class="rounded-lg border border-gray-200 dark:border-gray-800 p-4">
+                    <p class="text-xs text-gray-400 dark:text-gray-500 uppercase mb-2">Período A ({{ \Carbon\Carbon::parse($fromDate)->format('d/m/y') }}–{{ \Carbon\Carbon::parse($toDate)->format('d/m/y') }})</p>
+                    <p class="text-lg font-semibold text-gray-900 dark:text-gray-100">${{ money($summary['total']) }}</p>
+                    <p class="text-sm text-gray-500 dark:text-gray-400">{{ $summary['count'] }} {{ $summary['count'] === 1 ? 'venta' : 'ventas' }}</p>
+                </div>
+                <div class="rounded-lg border border-gray-200 dark:border-gray-800 p-4">
+                    <p class="text-xs text-gray-400 dark:text-gray-500 uppercase mb-2">Período B ({{ \Carbon\Carbon::parse($fromDateB)->format('d/m/y') }}–{{ \Carbon\Carbon::parse($toDateB)->format('d/m/y') }})</p>
+                    <p class="text-lg font-semibold text-gray-900 dark:text-gray-100">${{ money($comparisonB['summary']['total']) }}</p>
+                    <p class="text-sm text-gray-500 dark:text-gray-400">{{ $comparisonB['summary']['count'] }} {{ $comparisonB['summary']['count'] === 1 ? 'venta' : 'ventas' }}</p>
+                </div>
+                <div class="rounded-lg border border-gray-200 dark:border-gray-800 p-4">
+                    <p class="text-xs text-gray-400 dark:text-gray-500 uppercase mb-2">Diferencia (A vs B)</p>
+                    <p class="text-lg font-semibold {{ $pillClass($diffTotal) }}">{{ $diffTotal === null ? '—' : ($diffTotal >= 0 ? '+' : '').number_format($diffTotal, 1).'%' }} <span class="text-xs font-normal text-gray-400 dark:text-gray-500">plata</span></p>
+                    <p class="text-sm font-medium {{ $pillClass($diffCount) }}">{{ $diffCount === null ? '—' : ($diffCount >= 0 ? '+' : '').number_format($diffCount, 1).'%' }} <span class="text-xs font-normal text-gray-400 dark:text-gray-500">cant. de ventas</span></p>
+                </div>
+            </div>
+        @endif
+    </div>
+
+    @if ($summary['count'] === 0)
+        <div class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-12 text-center text-gray-400 dark:text-gray-500">
+            <x-heroicon-o-chart-bar class="w-10 h-10 mx-auto mb-3 text-gray-300 dark:text-gray-700" />
+            <p class="text-sm">No hay ventas en el período seleccionado.</p>
+        </div>
+    @else
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+            <x-stat-card label="Costo de mercadería" value="${{ money($profitability['cost']) }}" icon="cube" color="gray" />
+            <x-stat-card label="Ganancia bruta" value="${{ money($profitability['profit']) }}" icon="banknotes" color="emerald" />
+            <x-stat-card label="Margen" value="{{ number_format($profitability['marginPct'], 1) }}%" icon="chart-bar" color="sky" />
+        </div>
+
+        <section class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-5 mb-6">
+            <h2 class="text-sm font-medium text-gray-900 dark:text-gray-100 mb-4">Ventas por día</h2>
+            <div class="flex items-end gap-1.5 h-40 overflow-x-auto pb-1">
+                @foreach ($byDay as $row)
+                    <div wire:key="byday-{{ $loop->index }}" class="flex flex-col items-center justify-end shrink-0 group" style="min-width: 2rem;">
+                        <span class="text-[10px] text-gray-500 dark:text-gray-400 mb-1 opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">${{ number_format($row['total'], 0, ',', '.') }}</span>
+                        <div class="w-6 rounded-t bg-sky-500 dark:bg-sky-400 hover:bg-sky-600 dark:hover:bg-sky-300 transition-colors" style="height: {{ $maxDay > 0 ? max(4, round(($row['total'] / $maxDay) * 120)) : 4 }}px" title="{{ $row['label'] }}: ${{ money($row['total']) }} ({{ $row['count'] }} fact.)"></div>
+                        <span class="text-[10px] text-gray-500 dark:text-gray-400 mt-1 whitespace-nowrap">{{ $row['label'] }}</span>
+                    </div>
+                @endforeach
+            </div>
+        </section>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            @if ($puedeVerTodasLasSucursales && $sucursal_id === '' && $bySucursal->count() > 1)
+                <section class="lg:col-span-2 rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-5">
+                    <h2 class="text-sm font-medium text-gray-900 dark:text-gray-100 mb-4">Ventas por sucursal</h2>
+                    <div class="space-y-3">
+                        @foreach ($bySucursal as $row)
+                            <div wire:key="bysucursal-{{ $loop->index }}">
+                                <div class="flex justify-between text-sm mb-1">
+                                    <span class="text-gray-700 dark:text-gray-300 truncate pr-2">{{ $row['label'] }}</span>
+                                    <span class="text-gray-500 dark:text-gray-400 shrink-0">{{ $row['count'] }} {{ $row['count'] === 1 ? 'venta' : 'ventas' }} · ${{ money($row['total']) }}</span>
+                                </div>
+                                <div class="h-1.5 w-full rounded-full bg-gray-100 dark:bg-gray-800">
+                                    <div class="h-1.5 rounded-full bg-sky-500 dark:bg-sky-400" style="width: {{ $barPct($row['total'], $maxSucursal) }}%"></div>
+                                </div>
+                            </div>
+                        @endforeach
+                    </div>
+                </section>
+            @endif
+
+            <section class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-5">
+                <h2 class="text-sm font-medium text-gray-900 dark:text-gray-100 mb-4">Ventas por artículo</h2>
+                <div class="space-y-3">
+                    @foreach ($byArticle as $row)
+                        <div wire:key="byarticle-{{ $loop->index }}">
+                            <div class="flex justify-between text-sm mb-1">
+                                <span class="text-gray-700 dark:text-gray-300 truncate pr-2">{{ $row['label'] }}</span>
+                                <span class="text-gray-500 dark:text-gray-400 shrink-0">{{ rtrim(rtrim(number_format($row['quantity'], 2), '0'), '.') }} u. · ${{ money($row['total']) }}</span>
+                            </div>
+                            <div class="h-1.5 w-full rounded-full bg-gray-100 dark:bg-gray-800">
+                                <div class="h-1.5 rounded-full bg-sky-500 dark:bg-sky-400" style="width: {{ $barPct($row['total'], $maxArticle) }}%"></div>
+                            </div>
+                        </div>
+                    @endforeach
+                </div>
+            </section>
+
+            <section class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-5">
+                <h2 class="text-sm font-medium text-gray-900 dark:text-gray-100 mb-4">Ventas por categoría</h2>
+                <div class="space-y-3">
+                    @foreach ($byCategory as $row)
+                        <div wire:key="bycategory-{{ $loop->index }}">
+                            <div class="flex justify-between text-sm mb-1">
+                                <span class="text-gray-700 dark:text-gray-300 truncate pr-2">{{ $row['label'] }}</span>
+                                <span class="text-gray-500 dark:text-gray-400 shrink-0">{{ rtrim(rtrim(number_format($row['quantity'], 2), '0'), '.') }} u. · ${{ money($row['total']) }}</span>
+                            </div>
+                            <div class="h-1.5 w-full rounded-full bg-gray-100 dark:bg-gray-800">
+                                <div class="h-1.5 rounded-full bg-sky-500 dark:bg-sky-400" style="width: {{ $barPct($row['total'], $maxCategory) }}%"></div>
+                            </div>
+                        </div>
+                    @endforeach
+                </div>
+            </section>
+
+            <section class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-5">
+                <h2 class="text-sm font-medium text-gray-900 dark:text-gray-100 mb-4">Ventas por canal</h2>
+                <div class="space-y-3">
+                    @foreach ($byChannel as $row)
+                        <div wire:key="bychannel-{{ $loop->index }}">
+                            <div class="flex justify-between text-sm mb-1">
+                                <span class="text-gray-700 dark:text-gray-300 truncate pr-2">{{ $row['label'] }}</span>
+                                <span class="text-gray-500 dark:text-gray-400 shrink-0">{{ $row['count'] }} {{ $row['count'] === 1 ? 'venta' : 'ventas' }} · ${{ money($row['total']) }}</span>
+                            </div>
+                            <div class="h-1.5 w-full rounded-full bg-gray-100 dark:bg-gray-800">
+                                <div class="h-1.5 rounded-full bg-sky-500 dark:bg-sky-400" style="width: {{ $barPct($row['total'], $maxChannel) }}%"></div>
+                            </div>
+                        </div>
+                    @endforeach
+                </div>
+            </section>
+
+            <section class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-5">
+                <h2 class="text-sm font-medium text-gray-900 dark:text-gray-100 mb-4">Ventas por método de pago</h2>
+                <div class="space-y-3">
+                    @forelse ($byMethod as $row)
+                        <div wire:key="bymethod-{{ $loop->index }}">
+                            <div class="flex justify-between text-sm mb-1">
+                                <span class="text-gray-700 dark:text-gray-300 truncate pr-2">{{ $row['label'] }}</span>
+                                <span class="text-gray-500 dark:text-gray-400 shrink-0">${{ money($row['total']) }}</span>
+                            </div>
+                            <div class="h-1.5 w-full rounded-full bg-gray-100 dark:bg-gray-800">
+                                <div class="h-1.5 rounded-full bg-sky-500 dark:bg-sky-400" style="width: {{ $barPct($row['total'], $maxMethod) }}%"></div>
+                            </div>
+                        </div>
+                    @empty
+                        <p class="text-sm text-gray-400 dark:text-gray-500">Sin pagos registrados en el período.</p>
+                    @endforelse
+                </div>
+            </section>
+
+            <section class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-5">
+                <h2 class="text-sm font-medium text-gray-900 dark:text-gray-100 mb-4">Top clientes</h2>
+                <div class="space-y-3">
+                    @forelse ($byClient as $row)
+                        <div wire:key="byclient-{{ $loop->index }}">
+                            <div class="flex justify-between text-sm mb-1">
+                                <span class="text-gray-700 dark:text-gray-300 truncate pr-2">{{ $row['label'] }}</span>
+                                <span class="text-gray-500 dark:text-gray-400 shrink-0">{{ $row['count'] }} {{ $row['count'] === 1 ? 'factura' : 'facturas' }} · ${{ money($row['total']) }}</span>
+                            </div>
+                            <div class="h-1.5 w-full rounded-full bg-gray-100 dark:bg-gray-800">
+                                <div class="h-1.5 rounded-full bg-sky-500 dark:bg-sky-400" style="width: {{ $barPct($row['total'], $maxClient) }}%"></div>
+                            </div>
+                        </div>
+                    @empty
+                        <p class="text-sm text-gray-400 dark:text-gray-500">Sin ventas en el período.</p>
+                    @endforelse
+                </div>
+            </section>
+
+            <section class="rounded-2xl border border-sky-200 dark:border-gray-800 bg-sky-200/70 dark:bg-gray-900 shadow-sm p-5">
+                <h2 class="text-sm font-medium text-gray-900 dark:text-gray-100 mb-4">Ventas por hora del día</h2>
+                <div class="space-y-3">
+                    @foreach ($byHour as $row)
+                        <div wire:key="byhour-{{ $row['hour'] }}">
+                            <div class="flex justify-between text-sm mb-1">
+                                <span class="text-gray-700 dark:text-gray-300">{{ str_pad($row['hour'], 2, '0', STR_PAD_LEFT) }}:00 – {{ str_pad($row['hour'], 2, '0', STR_PAD_LEFT) }}:59</span>
+                                <span class="text-gray-500 dark:text-gray-400">{{ $row['count'] }} {{ $row['count'] === 1 ? 'venta' : 'ventas' }} · ${{ money($row['total']) }}</span>
+                            </div>
+                            <div class="h-1.5 w-full rounded-full bg-gray-100 dark:bg-gray-800">
+                                <div class="h-1.5 rounded-full bg-sky-500 dark:bg-sky-400" style="width: {{ $barPct($row['total'], $maxHour) }}%"></div>
+                            </div>
+                        </div>
+                    @endforeach
+                </div>
+            </section>
+        </div>
+    @endif
+</div>

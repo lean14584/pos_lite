@@ -99,7 +99,7 @@
                                 @endforeach
                             </select>
                             @error('condicion_iva') <p class="text-sm text-red-600 dark:text-red-400 mt-1">{{ $message }}</p> @enderror
-                            <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">Determina los tipos de comprobante — se elige en la pestaña Facturación ARCA.</p>
+                            <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">Determina los tipos de comprobante habilitados, más abajo.</p>
                         </div>
                     </div>
 
@@ -119,13 +119,17 @@
                         <label class="{{ $label }}">Domicilio</label>
                         <textarea wire:model="domicilio" rows="2" class="{{ $inputClass }}"></textarea>
                     </div>
-                </div>
 
-                {{-- Pestaña: Facturación electrónica (ARCA) --}}
-                <div x-show="tab === 'arca'" x-cloak class="space-y-4">
-                    <p class="text-sm text-gray-500 dark:text-gray-400">
-                        Cargá el certificado y la clave privada que te da ARCA. Los tipos de comprobante habilitados salen automáticamente de la condición ante IVA (pestaña Datos generales).
-                    </p>
+                    {{-- Facturación electrónica (ARCA): fusionada acá porque depende
+                         directo de la condición ante IVA de arriba — tenerla en una
+                         pestaña aparte obligaba a ir y volver para ver cuál factura
+                         quedaba habilitada por cuál condición. --}}
+                    <div class="{{ $sectionDivider }}">
+                        <h3 class="{{ $sectionTitle }} mb-3">Facturación electrónica (ARCA)</h3>
+                        <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
+                            Cargá el certificado y la clave privada que te da ARCA. Los tipos de comprobante habilitados salen automáticamente de la condición ante IVA de arriba.
+                        </p>
+                    </div>
 
                     @if(in_array($condicion_iva, ['monotributista', 'exento']))
                         <div class="flex items-center gap-3 rounded-xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-950/40 px-4 py-3">

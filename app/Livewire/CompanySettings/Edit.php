@@ -525,8 +525,10 @@ class Edit extends Component
     public function tabs(): array
     {
         $tabs = [
-            'general' => ['label' => 'Datos generales', 'icon' => 'building-office', 'fields' => ['cuit', 'razon_social', 'nombre_fantasia', 'domicilio', 'condicion_iva', 'logo']],
-            'arca' => ['label' => 'Facturación ARCA', 'icon' => 'document-text', 'fields' => ['factura_a_habilitada', 'factura_b_habilitada', 'cert', 'key']],
+            // Fusionada con Facturación ARCA (antes una pestaña aparte): el tipo
+            // de comprobante habilitado depende directo de condicion_iva, tenerlas
+            // separadas obligaba a ir y volver entre las dos para ver la relación.
+            'general' => ['label' => 'Datos generales', 'icon' => 'building-office', 'fields' => ['cuit', 'razon_social', 'nombre_fantasia', 'domicilio', 'condicion_iva', 'logo', 'factura_a_habilitada', 'factura_b_habilitada', 'cert', 'key']],
         ];
 
         if (! config('features.multisucursal')) {

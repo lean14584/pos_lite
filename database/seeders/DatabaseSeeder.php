@@ -80,16 +80,22 @@ class DatabaseSeeder extends Seeder
             Provider::create(['name' => 'Mayorista del Sur', 'email' => 'contacto@mayosur.com', 'phone' => '11-5555-2222']),
         ];
 
+        // sucursal_id en cada comprobante: con multisucursal apagado (ver
+        // Purchases\Index/Invoices\Index::puedeVerTodasLasSucursales()), el
+        // admin queda filtrado a SU sucursal — sin este campo, los
+        // comprobantes de muestra quedaban invisibles en los listados (el
+        // badge del menú sí los contaba, por una query sin ese filtro).
+
         // Draft invoice.
         $draft = Invoice::create([
-            'number' => 'FAC-0001', 'client_id' => $clients[0]->id, 'tax_rate' => 21,
+            'number' => 'FAC-0001', 'client_id' => $clients[0]->id, 'sucursal_id' => $sucursalId, 'tax_rate' => 21,
             'issue_date' => now(), 'due_date' => now()->addDays(15), 'status' => 'draft',
         ]);
         $draft->items()->create(['product_id' => $products[0]->id, 'description' => $products[0]->name, 'quantity' => 10, 'unit_price' => $products[0]->price]);
 
         // Paid invoice with payment method.
         $paid = Invoice::create([
-            'number' => 'FAC-0002', 'client_id' => $clients[1]->id, 'tax_rate' => 21,
+            'number' => 'FAC-0002', 'client_id' => $clients[1]->id, 'sucursal_id' => $sucursalId, 'tax_rate' => 21,
             'issue_date' => now()->subDays(3), 'due_date' => now()->addDays(12), 'status' => 'paid',
         ]);
         $paid->items()->create(['product_id' => $products[2]->id, 'description' => $products[2]->name, 'quantity' => 5, 'unit_price' => $products[2]->price]);
@@ -97,7 +103,7 @@ class DatabaseSeeder extends Seeder
 
         // Overdue invoice (pending, due date in the past).
         $overdue = Invoice::create([
-            'number' => 'FAC-0003', 'client_id' => $clients[2]->id, 'tax_rate' => 21,
+            'number' => 'FAC-0003', 'client_id' => $clients[2]->id, 'sucursal_id' => $sucursalId, 'tax_rate' => 21,
             'issue_date' => now()->subDays(30), 'due_date' => now()->subDays(15), 'status' => 'pending',
         ]);
         $overdue->items()->create(['product_id' => $products[4]->id, 'description' => $products[4]->name, 'quantity' => 8, 'unit_price' => $products[4]->price]);
@@ -111,7 +117,7 @@ class DatabaseSeeder extends Seeder
 
         // A purchase (already increments stock via direct creation here, so seed stock values above already assume it).
         $purchase = Purchase::create([
-            'number' => 'COM-0001', 'provider_id' => $providers[0]->id, 'tax_rate' => 21,
+            'number' => 'COM-0001', 'provider_id' => $providers[0]->id, 'sucursal_id' => $sucursalId, 'tax_rate' => 21,
             'issue_date' => now()->subDays(5), 'due_date' => now()->addDays(10), 'status' => 'pending',
         ]);
         $purchase->items()->create(['product_id' => $products[1]->id, 'description' => $products[1]->name, 'quantity' => 20, 'unit_price' => $products[1]->cost_price]);

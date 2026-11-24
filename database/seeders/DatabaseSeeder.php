@@ -7,9 +7,11 @@ use App\Models\Category;
 use App\Models\Client;
 use App\Models\Invoice;
 use App\Models\Product;
+use App\Models\ProductStock;
 use App\Models\Provider;
 use App\Models\Purchase;
 use App\Models\Quote;
+use App\Models\Sucursal;
 use App\Models\User;
 use Illuminate\Database\Console\Seeds\WithoutModelEvents;
 use Illuminate\Database\Seeder;
@@ -52,6 +54,18 @@ class DatabaseSeeder extends Seeder
             Product::create(['category_id' => $limpieza->id, 'name' => 'Detergente 750ml', 'sku' => 'LIM-001', 'price' => 1100, 'cost_price' => 700, 'stock' => 15, 'min_stock' => 3]),
             Product::create(['name' => 'Servicio de instalación', 'price' => 5000, 'stock' => 0]),
         ];
+
+        // El stock de arriba quedó en products.stock (columna agregada), pero
+        // el POS y el listado de Productos leen el desglose por sucursal
+        // (product_stocks) — igual que hace Products\Create::save(). Sin
+        // esto, los 5 productos de muestra arrancaban en 0 en cualquier
+        // pantalla real, aunque products.stock mostrara la cantidad cargada.
+        $sucursalId = Sucursal::first()->id;
+        foreach ($products as $product) {
+            if (! $product->sold_by_weight && $product->stock > 0) {
+                ProductStock::create(['product_id' => $product->id, 'sucursal_id' => $sucursalId, 'stock' => $product->stock]);
+            }
+        }
 
         Client::consumidorFinal();
 
